@@ -379,6 +379,14 @@ class MiniFoldMLX(nn.Module):
         """
         self.fold.miniformer.patch_sgmm_gate()
 
+    def enable_sgmm_out_gate(self) -> None:
+        """Enable the fused SGMM LayerNorm+gating Metal kernel for the output gating
+        step of TriangularUpdate (K=64 → N=128).
+
+        Must be called AFTER convert_to_bf16() since the kernel requires bfloat16 weights.
+        """
+        self.fold.miniformer.patch_sgmm_out_gate()
+
     def enable_compile_miniformer(self) -> None:
         """Wrap only MiniFormer with mx.compile, leaving ESM2 and StructureModule uncompiled.
 

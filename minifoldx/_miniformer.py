@@ -102,6 +102,7 @@ _SGMM_GATE_SOURCE = r"""
 """
 
 _SGMM_GATE_KERNEL = None   # built lazily on first use
+_SGMM_OUT_KERNEL  = None   # built lazily on first use
 
 
 def _get_sgmm_gate_kernel():
@@ -115,6 +116,107 @@ def _get_sgmm_gate_kernel():
             ensure_row_contiguous=True,
         )
     return _SGMM_GATE_KERNEL
+
+
+# ── Fused RMSNorm + proj*sigmoid(gate) Metal kernel (output gating, K=64→N=128) ──
+# norm_out is RMSNorm after convert_to_bf16(): no mean subtraction, no bias.
+# Phase 1 (8 SGs): RMSNorm per row, 32 lanes × 2 elems = 64 = C1_.
+# Phase 2 (16 SGs): dual SGMM, K-loop = C1_/8 = 8 iterations.
+_SGMM_OUT_SOURCE = r"""
+    constexpr uint BLOCK_M   = 8;
+    constexpr uint C1_       = 64;
+    constexpr uint C2_       = 128;
+    constexpr float EPS      = 1e-5f;
+
+    const uint tid    = thread_position_in_threadgroup.x;
+    const uint sg_idx = tid / 32;
+    const uint lane   = tid % 32;
+    const uint gid    = threadgroup_position_in_grid.x;
+    const uint base   = gid * BLOCK_M;
+
+    threadgroup bfloat smem_x[BLOCK_M * C1_];
+    threadgroup float  smem_p[BLOCK_M * C2_];
+    threadgroup float  smem_g[BLOCK_M * C2_];
+
+    // Phase 1: RMSNorm — 8 SGs, one row each (32 lanes × 2 elems = 64)
+    if (sg_idx < BLOCK_M) {
+        const uint row_g = base + sg_idx;
+        const uint col0  = lane * 2;
+        const uint xoff  = row_g * C1_ + col0;
+        const float v0 = float(x[xoff+0]), v1 = float(x[xoff+1]);
+        const float inv_rms = metal::rsqrt(
+            simd_sum(v0*v0 + v1*v1) * (1.0f / float(C1_)) + EPS);
+        const uint soff = sg_idx * C1_ + col0;
+        smem_x[soff+0] = bfloat(v0 * inv_rms * float(gamma[col0+0]));
+        smem_x[soff+1] = bfloat(v1 * inv_rms * float(gamma[col0+1]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: dual SGMM — 16 SGs × 8 output cols
+    {
+        simdgroup_bfloat8x8 x_tile, w_tile;
+        simdgroup_float8x8 acc_p = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 acc_g = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        const uint col_off = sg_idx * 8;
+        for (uint k = 0; k < C1_/8; k++) {
+            simdgroup_load(x_tile, (threadgroup const bfloat*)smem_x,
+                           C1_, ulong2(k*8, 0), false);
+            simdgroup_load(w_tile, W_p, C1_, ulong2(k*8, col_off), true);
+            simdgroup_multiply_accumulate(acc_p, x_tile, w_tile, acc_p);
+            simdgroup_load(w_tile, W_g, C1_, ulong2(k*8, col_off), true);
+            simdgroup_multiply_accumulate(acc_g, x_tile, w_tile, acc_g);
+        }
+        simdgroup_store(acc_p, (threadgroup float*)smem_p, C2_, ulong2(col_off, 0), false);
+        simdgroup_store(acc_g, (threadgroup float*)smem_g, C2_, ulong2(col_off, 0), false);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 3: bias + sigmoid gating (512 threads × 2 elems = 1024)
+    for (uint i = 0; i < 2; i++) {
+        const uint e   = tid * 2 + i;
+        const uint row = e / C2_;
+        const uint col = e % C2_;
+        const float p  = smem_p[e] + float(b_p[col]);
+        const float g_ = smem_g[e] + float(b_g[col]);
+        out[(base + row) * C2_ + col] = bfloat(p * (1.0f / (1.0f + metal::exp(-g_))));
+    }
+"""
+
+
+def _get_sgmm_out_kernel():
+    global _SGMM_OUT_KERNEL
+    if _SGMM_OUT_KERNEL is None:
+        _SGMM_OUT_KERNEL = mx.fast.metal_kernel(
+            name="sgmm_out_gate",
+            input_names=["x", "gamma", "W_p", "b_p", "W_g", "b_g"],
+            output_names=["out"],
+            source=_SGMM_OUT_SOURCE,
+            ensure_row_contiguous=True,
+        )
+    return _SGMM_OUT_KERNEL
+
+
+def _sgmm_out_gate(x: mx.array,
+                   gamma: mx.array,
+                   W_p: mx.array, b_p: mx.array,
+                   W_g: mx.array, b_g: mx.array) -> mx.array:
+    """Fused RMSNorm+SGMM output gate. x: [B,L,L,64] bf16 → [B,L,L,128] bf16."""
+    B, L1, L2, C = x.shape
+    M = B * L1 * L2
+    M_pad = ((M + _SGMM_BLOCK_M - 1) // _SGMM_BLOCK_M) * _SGMM_BLOCK_M
+    x_flat = x.reshape(M, C)
+    if M_pad > M:
+        x_flat = mx.pad(x_flat, [(0, M_pad - M), (0, 0)])
+    n_total = (M_pad // _SGMM_BLOCK_M) * _SGMM_TG_THREADS
+    (out,) = _get_sgmm_out_kernel()(
+        inputs=[x_flat, gamma, W_p, b_p, W_g, b_g],
+        template=[("T", mx.bfloat16)],
+        grid=(n_total, 1, 1),
+        threadgroup=(_SGMM_TG_THREADS, 1, 1),
+        output_shapes=[(M_pad, 128)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return out[:M].reshape(B, L1, L2, 128)
 
 
 _SGMM_BLOCK_M    = 8
@@ -206,8 +308,11 @@ class TriangularUpdate(nn.Module):
         x = mx.concatenate([x1, x2], axis=-1)  # (B, N, N, D//2)
 
         # Output gating: D/2 -> D
-        x = self.norm_out(x)
-        x = self.proj_out(x) * mx.sigmoid(self.gate_out(x))
+        if hasattr(self, '_fused_output_gate'):
+            x = self._fused_output_gate(x)
+        else:
+            x = self.norm_out(x)
+            x = self.proj_out(x) * mx.sigmoid(self.gate_out(x))
         return x
 
 
@@ -276,6 +381,36 @@ class MiniFormer(nn.Module):
                                _make_fused(gamma, beta, W_p, b_p, W_g, b_g))
 
         print(f"SGMM gate kernel enabled on {len(self.blocks)} TriangularUpdate blocks.")
+
+    def patch_sgmm_out_gate(self) -> None:
+        """Replace the norm_out + output gating step in every TriangularUpdate block
+        with a fused SIMD-group matrix multiply Metal kernel.
+
+        The kernel fuses:  LayerNorm(x) → proj_out(x_norm) * sigmoid(gate_out(x_norm))
+        where x has shape [B, L, L, 64] (D/2 after triangular projection).
+
+        Requirements:
+          - Model weights must be in bfloat16 (call convert_to_bf16() first)
+          - dim must be 128 (hardcoded: C1_=64, C2_=128)
+          - Apple Silicon GPU (Metal 3+)
+        """
+        for block in self.blocks:
+            tri = block.triangular
+            gamma = tri.norm_out.weight
+            W_p   = tri.proj_out.weight
+            b_p   = tri.proj_out.bias
+            W_g   = tri.gate_out.weight
+            b_g   = tri.gate_out.bias
+
+            def _make_fused_out(gamma, W_p, b_p, W_g, b_g):
+                def _fused(x):
+                    return _sgmm_out_gate(x, gamma, W_p, b_p, W_g, b_g)
+                return _fused
+
+            object.__setattr__(tri, '_fused_output_gate',
+                               _make_fused_out(gamma, W_p, b_p, W_g, b_g))
+
+        print(f"SGMM out-gate kernel enabled on {len(self.blocks)} TriangularUpdate blocks.")
 
     def patch_norms_rms_absorb_bias(self, triangular: bool = True, transition: bool = False,
                                     tri_norm_in: bool = True, tri_norm_out: bool = True):
