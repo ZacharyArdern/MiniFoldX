@@ -368,6 +368,58 @@ class MiniFoldMLX(nn.Module):
         object.__setattr__(self, '_compiled_fold', mx.compile(self.fold))
         print("FoldingTrunk compiled with mx.compile — first call will pay compilation cost.")
 
+    def enable_bf16_esm2(self) -> None:
+        """Dequantize ESM2 weights from int8 to bfloat16 in-place.
+
+        If the model was loaded from an int8-quantized checkpoint (ESM2_MiniFold_int8),
+        this replaces every QuantizedLinear in ESM2 with a regular bf16 Linear.
+
+        NOTE: For single-sequence protein folding inference this is typically SLOWER
+        than int8, not faster.  ESM2 inference at batch_size=1 is memory-bandwidth-bound:
+        the full 3B-parameter weight read per forward pass costs more in bf16 (~5.6GB)
+        than in int8 (~3.5GB), outweighing the AMX compute advantage of bf16 matmul.
+        Benchmarks on Apple Silicon (M-series) show 0.71–0.90× for L=100–400.
+
+        Use this only if you need higher numerical precision, are running very large
+        batch sizes (where compute becomes the bottleneck), or are diagnosing
+        quantization quality. For normal AlphaTracer inference, keep the default int8.
+
+        Memory cost: +~2GB (int8+scales ~3.5GB → bf16 ~5.6GB for ESM2-3B).
+        Must be called AFTER load_model(). Safe to call on a non-quantized model
+        (no-op if no QuantizedLinear layers are found).
+        """
+        import mlx.nn as _nn
+
+        def _dequant_linear(q: "_nn.QuantizedLinear") -> "_nn.Linear":
+            w = mx.dequantize(
+                q.weight, q.scales, q.biases, q.group_size, q.bits
+            ).astype(mx.bfloat16)
+            lin = _nn.Linear(w.shape[1], w.shape[0], bias=q.bias is not None)
+            lin.weight = w
+            if q.bias is not None:
+                lin.bias = q.bias.astype(mx.bfloat16)
+            return lin
+
+        esm = self._esm_model
+        n_replaced = 0
+        for i in range(esm.num_layers):
+            layer = getattr(esm, f'layer_{i}')
+            for proj in ['q_proj', 'k_proj', 'v_proj', 'out_proj']:
+                old = getattr(layer.self_attn, proj)
+                if isinstance(old, _nn.QuantizedLinear):
+                    setattr(layer.self_attn, proj, _dequant_linear(old))
+                    n_replaced += 1
+            for fc in ['fc1', 'fc2']:
+                old = getattr(layer, fc)
+                if isinstance(old, _nn.QuantizedLinear):
+                    setattr(layer, fc, _dequant_linear(old))
+                    n_replaced += 1
+        mx.eval(esm.parameters())
+        if n_replaced:
+            print(f"ESM2 dequantized: {n_replaced} QuantizedLinear → bf16 Linear.")
+        else:
+            print("enable_bf16_esm2: no QuantizedLinear layers found (already bf16?).")
+
     def enable_sgmm_gate(self) -> None:
         """Enable the fused SGMM LayerNorm+gating Metal kernel for TriangularUpdate.
 
