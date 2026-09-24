@@ -310,8 +310,8 @@ C_S, C_Z = 1024, 128
 ESMC_HIDDEN = 1152   # ESMC 600M hidden dim
 ESMC_ATTN   = 648    # 36 layers × 18 heads
 
-fc_s = nn.Sequential(nn.Linear(ESMC_HIDDEN, C_S), nn.ReLU(), nn.Linear(C_S, C_S)).half().cuda()
-fc_z = nn.Sequential(nn.Linear(ESMC_ATTN,  C_Z), nn.ReLU(), nn.Linear(C_Z, C_Z)).half().cuda()
+fc_s = nn.Sequential(nn.Linear(ESMC_HIDDEN, C_S), nn.ReLU(), nn.Linear(C_S, C_S)).cuda()  # fp32
+fc_z = nn.Sequential(nn.Linear(ESMC_ATTN,  C_Z), nn.ReLU(), nn.Linear(C_Z, C_Z)).cuda()   # fp32
 log(f"  fc_s params: {sum(p.numel() for p in fc_s.parameters()):,}")
 log(f"  fc_z params: {sum(p.numel() for p in fc_z.parameters()):,}")
 
@@ -329,10 +329,10 @@ def esmc_forward(seq: str):
     input_ids = encoded["input_ids"].cuda()
     with torch.no_grad():
         out = esmc(input_ids=input_ids, output_attentions=True)
-    hidden = out.last_hidden_state[:, 1:-1]           # (1, L, 1152) strip BOS/EOS
+    hidden = out.last_hidden_state[:, 1:-1].float()    # (1, L, 1152) fp32, strip BOS/EOS
     # attentions: tuple of 36 × (1, 18, L+2, L+2)
-    attns = torch.stack(out.attentions, dim=1)        # (1, 36, 18, L+2, L+2)
-    attns = attns[:, :, :, 1:-1, 1:-1]                # strip BOS/EOS → (1, 36, 18, L, L)
+    attns = torch.stack(out.attentions, dim=1)         # (1, 36, 18, L+2, L+2)
+    attns = attns[:, :, :, 1:-1, 1:-1].float()         # strip BOS/EOS → (1, 36, 18, L, L) fp32
     L = hidden.shape[1]
     s_z_in = attns.permute(0,3,4,1,2).reshape(1, L, L, ESMC_ATTN)  # (1,L,L,648)
     return hidden, s_z_in
@@ -387,14 +387,17 @@ for epoch in range(args.epochs):
 
         mask = torch.ones(1, L, dtype=torch.float16, device="cuda")
 
-        # Project
-        s_s = fc_s(hidden)            # (1,L,1024)
-        s_z = fc_z(s_z_in)            # (1,L,L,128)
+        # Project in fp32, then cast to fp16 for frozen trunk
+        s_s = fc_s(hidden).half()            # (1,L,1024)
+        s_z = fc_z(s_z_in).half()            # (1,L,L,128)
 
         # Trunk forward (frozen weights, but in compute graph for gradients)
         preds, _ = trunk(s_s, s_z, mask, num_recycling=0)  # (1,L,L,64)
 
         loss = distogram_loss(preds, true_bins, mask)
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            continue
 
         optimizer.zero_grad()
         loss.backward()
@@ -431,7 +434,7 @@ for epoch in range(args.epochs):
             if L != len(seq):
                 continue
             mask = torch.ones(1, L, dtype=torch.float16, device="cuda")
-            s_s = fc_s(hidden); s_z = fc_z(s_z_in)
+            s_s = fc_s(hidden).half(); s_z = fc_z(s_z_in).half()
             preds, _ = trunk(s_s, s_z, mask, num_recycling=0)
             test_losses.append(distogram_loss(preds, true_bins, mask).item())
 
