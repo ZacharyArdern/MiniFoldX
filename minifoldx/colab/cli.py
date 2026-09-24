@@ -131,6 +131,75 @@ def run(
 
 
 @main.command()
+@click.option("--gpu",        default="A100", type=click.Choice(GPU_CHOICES), show_default=True)
+@click.option("--epochs",     default=15,    show_default=True)
+@click.option("--lr",         default=1e-3,  show_default=True)
+@click.option("--max-len",    default=300,   show_default=True)
+@click.option("--min-len",    default=40,    show_default=True)
+@click.option("--ckpt-every", default=500,   show_default=True)
+@click.option("--timeout",    default=7200,  show_default=True)
+@click.option("--out", "out_dest", default="both",
+              type=click.Choice(["both", "pwd", "drive"]), show_default=True)
+def train(
+    gpu: str,
+    epochs: int,
+    lr: float,
+    max_len: int,
+    min_len: int,
+    ckpt_every: int,
+    timeout: int,
+    out_dest: str,
+) -> None:
+    """Train fc_s / fc_z for ESMC 600M → MiniFoldX 12L on CATH S20."""
+    check_deps()
+
+    from datetime import datetime, timezone
+    job_id  = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    session = f"minifold_train_{job_id}"
+
+    click.echo(f"Job ID  : {job_id}")
+    click.echo(f"GPU     : {gpu}  |  epochs: {epochs}  |  lr: {lr}")
+    click.echo(f"Output  : {out_dest}\n")
+
+    colab("new", "--gpu", gpu, "-s", session)
+
+    drive = _has_drive()
+    if not drive and out_dest in ("both", "drive"):
+        click.echo("Note: Drive not configured — results will be downloaded locally only.")
+        out_dest = "pwd"
+
+    try:
+        from ._runner import make_training_script, RCLONE_CONF, HF_TOKEN_PATH
+        import tempfile
+        script = make_training_script(
+            job_id=job_id, epochs=epochs, lr=lr, max_len=max_len,
+            min_len=min_len, ckpt_every=ckpt_every, out_dest=out_dest,
+            has_drive=drive,
+        )
+
+        if drive:
+            colab("exec", "-s", session, "--timeout", "10", "-f", "/dev/stdin",
+                  input="import os; os.makedirs('/root/.config/rclone', exist_ok=True)", text=True)
+            colab("upload", "-s", session, str(RCLONE_CONF), "/root/.config/rclone/rclone.conf")
+
+        if HF_TOKEN_PATH.exists():
+            colab("exec", "-s", session, "--timeout", "10", "-f", "/dev/stdin",
+                  input="import os; os.makedirs('/root/.cache/huggingface', exist_ok=True)", text=True)
+            colab("upload", "-s", session, str(HF_TOKEN_PATH), "/root/.cache/huggingface/token")
+
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+            f.write(script)
+            script_path = f.name
+
+        colab("exec", "-s", session, "-f", script_path, "--timeout", str(timeout))
+        click.echo("\nTraining complete.")
+
+    finally:
+        import subprocess as _sp
+        _sp.run(["colab", "stop", "-s", session])
+
+
+@main.command()
 @click.argument("job_id")
 @click.option("--out-dir", default="./minifold_results", show_default=True)
 def fetch(job_id: str, out_dir: str) -> None:
