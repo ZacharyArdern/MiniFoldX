@@ -113,6 +113,7 @@ else:
 
 # ── 4. Parse CATH S20 sequences ──────────────────────────────────────────────
 log("=== Parsing CATH S20 sequences ===")
+# FASTA header format: >cath|4_4_0|12asA00/4-330  →  domain_id = 12asA00
 seqs = {}
 with open(FA_PATH) as fh:
     domain_id = None
@@ -122,7 +123,9 @@ with open(FA_PATH) as fh:
         if line.startswith(">"):
             if domain_id:
                 seqs[domain_id] = "".join(seq_buf)
-            domain_id = line[1:].split()[0]
+            raw_id = line[1:].split()[0]                  # cath|4_4_0|12asA00/4-330
+            parts  = raw_id.split("|")
+            domain_id = parts[2].split("/")[0] if len(parts) >= 3 else raw_id.split("/")[0]
             seq_buf = []
         else:
             seq_buf.append(line)
@@ -180,8 +183,11 @@ for domain_id, seq in seqs.items():
     L = len(seq)
     if L < args.min_len or L > args.max_len:
         continue
-    # PDB files may be directly in PDB_DIR or in subdirs
-    candidates = list(PDB_DIR.glob(f"**/{domain_id}.pdb")) + list(PDB_DIR.glob(f"**/{domain_id}.ent"))
+    # CATH dompdb tgz extracts files without extension (e.g. dompdb/12asA00)
+    # Also try .pdb and .ent variants
+    candidates = (list(PDB_DIR.glob(f"**/{domain_id}"))
+                + list(PDB_DIR.glob(f"**/{domain_id}.pdb"))
+                + list(PDB_DIR.glob(f"**/{domain_id}.ent")))
     if not candidates:
         continue
     pdb_seq, coords = parse_cb_coords(candidates[0])
@@ -238,11 +244,11 @@ from minifold.model.miniformer import MiniFormer as MiniFormerPT
 class SequenceToPair(nn.Module):
     def __init__(self, c_s, inner_dim, c_z):
         super().__init__()
-        self.norm = nn.LayerNorm(c_s)
+        self.layernorm = nn.LayerNorm(c_s)   # matches checkpoint key 'seq_to_pair.layernorm'
         self.proj   = nn.Linear(c_s, inner_dim * 2, bias=True)
         self.o_proj = nn.Linear(inner_dim * 2, c_z, bias=True)
     def forward(self, s):
-        s = self.proj(self.norm(s))
+        s = self.proj(self.layernorm(s))
         q, k = s.chunk(2, dim=-1)
         return self.o_proj(torch.cat([q[:,None,:,:]*k[:,:,None,:],
                                        q[:,None,:,:]-k[:,:,None,:]], dim=-1))
@@ -282,7 +288,13 @@ class FoldingTrunk(nn.Module):
 # Load trunk weights from checkpoint
 sd = load_file(str(CKPT_PATH), device="cpu")
 trunk = FoldingTrunk(c_s=1024, c_z=128, bins=32, disto_bins=64, num_layers=12)
-trunk_sd = {k.replace("fold.", ""): v for k, v in sd.items() if k.startswith("fold.")}
+trunk_sd = {}
+for k, v in sd.items():
+    if not k.startswith("model.fold."):
+        continue
+    new_k = k.replace("model.fold.", "")
+    new_k = new_k.replace("miniformer._orig_mod.", "miniformer.")
+    trunk_sd[new_k] = v
 missing, unexpected = trunk.load_state_dict(trunk_sd, strict=False)
 if missing:
     log(f"  WARNING: {len(missing)} missing trunk keys: {missing[:3]}")
