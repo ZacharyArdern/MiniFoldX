@@ -75,26 +75,31 @@ run("uv", "pip", "install", "--system", "-q",
     "dm-tree", "ml-collections", "modelcif", "edit_distance", "fair-esm")
 
 
-# ── 2. Download CATH S20 ─────────────────────────────────────────────────────
-log("=== Downloading CATH S20 ===")
-CATH_BASE = "http://download.cathdb.info/cath/releases/latest-release/non-redundant-data-sets"
-FA_PATH   = DATA_DIR / "cath_s20.fa"
-PDB_TGZ   = DATA_DIR / "cath_s20.pdb.tgz"
-PDB_DIR   = DATA_DIR / "pdbs"
+# ── 2. Download CATH S20 (or load pre-processed .npz from weights cache) ─────
+COORDS_NPZ = WEIGHTS_DIR / "cath_s20_coords.npz"
+CATH_BASE  = "http://download.cathdb.info/cath/releases/latest-release/non-redundant-data-sets"
 
-if not FA_PATH.exists():
-    urllib.request.urlretrieve(f"{CATH_BASE}/cath-dataset-nonredundant-S20.fa",  str(FA_PATH))
-    log(f"  Downloaded {FA_PATH.name}")
-if not PDB_TGZ.exists():
-    log("  Downloading PDB structures (~350 MB) ...")
-    urllib.request.urlretrieve(f"{CATH_BASE}/cath-dataset-nonredundant-S20.pdb.tgz", str(PDB_TGZ))
-    log(f"  Downloaded {PDB_TGZ.name}")
-if not PDB_DIR.exists():
-    log("  Extracting PDB files ...")
-    PDB_DIR.mkdir()
-    with tarfile.open(PDB_TGZ, "r:gz") as tf:
-        tf.extractall(PDB_DIR)
-    log(f"  Extracted to {PDB_DIR}/")
+if not COORDS_NPZ.exists():
+    log("=== Downloading CATH S20 ===")
+    FA_PATH = DATA_DIR / "cath_s20.fa"
+    PDB_TGZ = DATA_DIR / "cath_s20.pdb.tgz"
+    PDB_DIR = DATA_DIR / "pdbs"
+
+    if not FA_PATH.exists():
+        urllib.request.urlretrieve(f"{CATH_BASE}/cath-dataset-nonredundant-S20.fa", str(FA_PATH))
+        log(f"  Downloaded {FA_PATH.name}")
+    if not PDB_TGZ.exists():
+        log("  Downloading PDB structures (~350 MB) ...")
+        urllib.request.urlretrieve(f"{CATH_BASE}/cath-dataset-nonredundant-S20.pdb.tgz", str(PDB_TGZ))
+        log(f"  Downloaded {PDB_TGZ.name}")
+    if not PDB_DIR.exists():
+        log("  Extracting PDB files ...")
+        PDB_DIR.mkdir()
+        with tarfile.open(PDB_TGZ, "r:gz") as tf:
+            tf.extractall(PDB_DIR)
+        log(f"  Extracted to {PDB_DIR}/")
+else:
+    log(f"=== Using pre-processed coords cache: {COORDS_NPZ.name} ===")
 
 
 # ── 3. Download MiniFoldX 12L checkpoint ─────────────────────────────────────
@@ -111,92 +116,97 @@ else:
     log(f"  Using cached {CKPT_PATH.name}")
 
 
-# ── 4. Parse CATH S20 sequences ──────────────────────────────────────────────
-log("=== Parsing CATH S20 sequences ===")
-# FASTA header format: >cath|4_4_0|12asA00/4-330  →  domain_id = 12asA00
-seqs = {}
-with open(FA_PATH) as fh:
-    domain_id = None
-    seq_buf = []
-    for line in fh:
-        line = line.strip()
-        if line.startswith(">"):
-            if domain_id:
-                seqs[domain_id] = "".join(seq_buf)
-            raw_id = line[1:].split()[0]                  # cath|4_4_0|12asA00/4-330
-            parts  = raw_id.split("|")
-            domain_id = parts[2].split("/")[0] if len(parts) >= 3 else raw_id.split("/")[0]
-            seq_buf = []
-        else:
-            seq_buf.append(line)
-    if domain_id:
-        seqs[domain_id] = "".join(seq_buf)
+# ── 4 & 5. Load domains (from .npz cache or raw PDB files) ───────────────────
+import numpy as np
 
-log(f"  {len(seqs)} sequences parsed")
+domains = {}
 
+if COORDS_NPZ.exists():
+    log("=== Loading domains from .npz cache ===")
+    data = np.load(str(COORDS_NPZ), allow_pickle=True)
+    ids      = data["domain_ids"].tolist()
+    seqs_arr = data["sequences"].tolist()
+    lengths  = data["lengths"]
+    coords_f = data["coords_flat"]
+    offset   = 0
+    for did, seq, L in zip(ids, seqs_arr, lengths):
+        L = int(L)
+        if args.min_len <= len(seq) <= args.max_len:
+            domains[did] = {"seq": seq, "coords": coords_f[offset:offset+L]}
+        offset += L
+    log(f"  {len(domains)} domains in length range [{args.min_len},{args.max_len}]")
 
-# ── 5. Parse Cβ coordinates from PDB files ───────────────────────────────────
-log("=== Extracting Cβ coordinates ===")
+else:
+    log("=== Parsing CATH S20 sequences ===")
+    seqs = {}
+    with open(FA_PATH) as fh:
+        domain_id = None
+        seq_buf = []
+        for line in fh:
+            line = line.strip()
+            if line.startswith(">"):
+                if domain_id:
+                    seqs[domain_id] = "".join(seq_buf)
+                raw_id = line[1:].split()[0]
+                parts  = raw_id.split("|")
+                domain_id = parts[2].split("/")[0] if len(parts) >= 3 else raw_id.split("/")[0]
+                seq_buf = []
+            else:
+                seq_buf.append(line)
+        if domain_id:
+            seqs[domain_id] = "".join(seq_buf)
+    log(f"  {len(seqs)} sequences parsed")
 
-def parse_cb_coords(pdb_path: Path):
-    """Return (seq, coords) where coords is list of (x,y,z) Cβ (or Cα for Gly)."""
-    import numpy as np
+    log("=== Extracting Cβ coordinates ===")
     aa3to1 = {"ALA":"A","ARG":"R","ASN":"N","ASP":"D","CYS":"C","GLN":"Q","GLU":"E",
                "GLY":"G","HIS":"H","ILE":"I","LEU":"L","LYS":"K","MET":"M","PHE":"F",
                "PRO":"P","SER":"S","THR":"T","TRP":"W","TYR":"Y","VAL":"V"}
-    residues = {}
-    with open(pdb_path) as fh:
-        for line in fh:
-            if not (line.startswith("ATOM") or line.startswith("HETATM")):
-                continue
-            atom_name = line[12:16].strip()
-            res_name  = line[17:20].strip()
-            res_seq   = int(line[22:26].strip())
-            try:
-                x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
-            except ValueError:
-                continue
-            if res_name not in aa3to1:
-                continue
-            aa = aa3to1[res_name]
-            if res_seq not in residues:
-                residues[res_seq] = {"aa": aa, "CA": None, "CB": None}
-            if atom_name == "CA":
-                residues[res_seq]["CA"] = np.array([x, y, z])
-            elif atom_name == "CB":
-                residues[res_seq]["CB"] = np.array([x, y, z])
 
-    seq, coords = [], []
-    for res_seq in sorted(residues):
-        r = residues[res_seq]
-        coord = r["CB"] if r["CB"] is not None else r["CA"]  # Gly has no CB
-        if coord is None:
+    def parse_cb_coords(pdb_path: Path):
+        residues = {}
+        with open(pdb_path) as fh:
+            for line in fh:
+                if not (line.startswith("ATOM") or line.startswith("HETATM")):
+                    continue
+                atom_name = line[12:16].strip()
+                res_name  = line[17:20].strip()
+                res_seq   = int(line[22:26].strip())
+                try:
+                    x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+                except ValueError:
+                    continue
+                if res_name not in aa3to1:
+                    continue
+                if res_seq not in residues:
+                    residues[res_seq] = {"aa": aa3to1[res_name], "CA": None, "CB": None}
+                if atom_name == "CA":
+                    residues[res_seq]["CA"] = np.array([x, y, z])
+                elif atom_name == "CB":
+                    residues[res_seq]["CB"] = np.array([x, y, z])
+        seq, coords = [], []
+        for r in (residues[k] for k in sorted(residues)):
+            c = r["CB"] if r["CB"] is not None else r["CA"]
+            if c is None:
+                continue
+            seq.append(r["aa"])
+            coords.append(c)
+        return "".join(seq), np.stack(coords) if coords else None
+
+    for domain_id, seq in seqs.items():
+        L = len(seq)
+        if L < args.min_len or L > args.max_len:
             continue
-        seq.append(r["aa"])
-        coords.append(coord)
-    return "".join(seq), np.stack(coords) if coords else None
+        candidates = (list(PDB_DIR.glob(f"**/{domain_id}"))
+                    + list(PDB_DIR.glob(f"**/{domain_id}.pdb"))
+                    + list(PDB_DIR.glob(f"**/{domain_id}.ent")))
+        if not candidates:
+            continue
+        pdb_seq, coords = parse_cb_coords(candidates[0])
+        if coords is None or len(coords) < args.min_len:
+            continue
+        domains[domain_id] = {"seq": pdb_seq, "coords": coords}
 
-
-import numpy as np
-domains = {}
-for domain_id, seq in seqs.items():
-    L = len(seq)
-    if L < args.min_len or L > args.max_len:
-        continue
-    # CATH dompdb tgz extracts files without extension (e.g. dompdb/12asA00)
-    # Also try .pdb and .ent variants
-    candidates = (list(PDB_DIR.glob(f"**/{domain_id}"))
-                + list(PDB_DIR.glob(f"**/{domain_id}.pdb"))
-                + list(PDB_DIR.glob(f"**/{domain_id}.ent")))
-    if not candidates:
-        continue
-    pdb_seq, coords = parse_cb_coords(candidates[0])
-    if coords is None or len(coords) < args.min_len:
-        continue
-    # Use the seq from the PDB (may differ slightly from FASTA due to missing residues)
-    domains[domain_id] = {"seq": pdb_seq, "coords": coords}
-
-log(f"  {len(domains)} domains with coordinates in length range [{args.min_len},{args.max_len}]")
+    log(f"  {len(domains)} domains with coordinates in length range [{args.min_len},{args.max_len}]")
 
 
 # ── 6. Distance binning ────────────────────────────────────────────────────────
