@@ -26,6 +26,7 @@ parser.add_argument("--out",      default=None, help="Output .npz path (default:
 parser.add_argument("--min-len",  type=int, default=40)
 parser.add_argument("--max-len",  type=int, default=300)
 parser.add_argument("--no-upload", action="store_true", help="Skip rclone upload")
+parser.add_argument("--workers",   type=int, default=8)
 args = parser.parse_args()
 
 DATA_DIR = Path(args.data_dir).expanduser()
@@ -34,6 +35,15 @@ OUT_PATH = Path(args.out).expanduser() if args.out else DATA_DIR / "cath_s20_coo
 
 T0 = time.time()
 def log(msg): print(f"[{time.time()-T0:5.1f}s] {msg}", flush=True)
+
+
+# ── Install gemmi if needed ───────────────────────────────────────────────────
+try:
+    import gemmi
+except ImportError:
+    log("Installing gemmi ...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "gemmi"], check=True)
+    import gemmi
 
 
 # ── Download ──────────────────────────────────────────────────────────────────
@@ -89,85 +99,82 @@ with open(FA_PATH) as fh:
 log(f"  {len(seqs)} sequences")
 
 
-# ── Extract Cβ coords ─────────────────────────────────────────────────────────
-log(f"=== Extracting Cβ coordinates (len {args.min_len}–{args.max_len}) ===")
-
-AA3TO1 = {"ALA":"A","ARG":"R","ASN":"N","ASP":"D","CYS":"C","GLN":"Q","GLU":"E",
-           "GLY":"G","HIS":"H","ILE":"I","LEU":"L","LYS":"K","MET":"M","PHE":"F",
-           "PRO":"P","SER":"S","THR":"T","TRP":"W","TYR":"Y","VAL":"V"}
-
-def parse_cb(pdb_path: Path):
-    residues = {}
-    with open(pdb_path) as fh:
-        for line in fh:
-            if not (line.startswith("ATOM") or line.startswith("HETATM")):
-                continue
-            atom  = line[12:16].strip()
-            res3  = line[17:20].strip()
-            resid = int(line[22:26].strip())
-            try:
-                xyz = np.array([float(line[30:38]), float(line[38:46]), float(line[46:54])])
-            except ValueError:
-                continue
-            if res3 not in AA3TO1:
-                continue
-            if resid not in residues:
-                residues[resid] = {"aa": AA3TO1[res3], "CA": None, "CB": None}
-            if atom == "CA":
-                residues[resid]["CA"] = xyz
-            elif atom == "CB":
-                residues[resid]["CB"] = xyz
-    seq, coords = [], []
-    for r in (residues[k] for k in sorted(residues)):
-        c = r["CB"] if r["CB"] is not None else r["CA"]
-        if c is None:
-            continue
-        seq.append(r["aa"])
-        coords.append(c)
-    return "".join(seq), np.stack(coords).astype(np.float32) if coords else None
+# ── Build PDB path index ──────────────────────────────────────────────────────
+log("=== Indexing PDB files ===")
+pdb_index = {}
+for p in PDB_DIR.rglob("*"):
+    if p.is_file():
+        pdb_index[p.stem] = p   # stem strips .pdb/.ent; CATH files have no ext so stem==name
+log(f"  {len(pdb_index)} files indexed")
 
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# ── Extract Cβ coords with gemmi ──────────────────────────────────────────────
+log(f"=== Extracting Cβ coordinates (len {args.min_len}–{args.max_len}, {args.workers} workers) ===")
+
+VALID_AA = set("ACDEFGHIKLMNPQRSTVWY")
 
 def process(item):
     domain_id, seq = item
     L = len(seq)
     if L < args.min_len or L > args.max_len:
         return None
-    hits = (list(PDB_DIR.glob(f"**/{domain_id}"))
-          + list(PDB_DIR.glob(f"**/{domain_id}.pdb"))
-          + list(PDB_DIR.glob(f"**/{domain_id}.ent")))
-    if not hits:
+    pdb_path = pdb_index.get(domain_id)
+    if pdb_path is None:
         return None
-    pdb_seq, coords = parse_cb(hits[0])
-    if coords is None or len(coords) < args.min_len:
-        return None
-    return domain_id, pdb_seq, coords
+    try:
+        st    = gemmi.read_pdb(str(pdb_path))
+        model = st[0]
+        res_coords = []
+        for chain in model:
+            for res in chain:
+                info = gemmi.find_tabulated_residue(res.name)
+                aa = info.one_letter_code if info.found() else "X"
+                if aa not in VALID_AA:
+                    continue
+                atom = res.find_atom("CB", "\0") or res.find_atom("CA", "\0")
+                if atom is None:
+                    continue
+                res_coords.append((aa, atom.pos.x, atom.pos.y, atom.pos.z))
+        if len(res_coords) < args.min_len:
+            return None
+        pdb_seq = "".join(r[0] for r in res_coords)
+        coords  = np.array([[r[1], r[2], r[3]] for r in res_coords], dtype=np.float32)
+        return domain_id, pdb_seq, coords
+    except Exception as e:
+        return ("ERROR", str(e), None)
+
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+
+items = [(did, seq) for did, seq in seqs.items()
+         if args.min_len <= len(seq) <= args.max_len and did in pdb_index]
+log(f"  {len(items)} candidates to process")
 
 domains_out = {}
-items = list(seqs.items())
-n = len(items)
 done = 0
-with ThreadPoolExecutor(max_workers=8) as ex:
+with ProcessPoolExecutor(max_workers=args.workers, mp_context=multiprocessing.get_context("fork")) as ex:
     futs = {ex.submit(process, it): it for it in items}
     for fut in as_completed(futs):
         done += 1
         res = fut.result()
-        if res:
+        if res and res[0] == "ERROR" and done < 5:
+            log(f"  ERROR sample: {res[1]}")
+        elif res and res[0] != "ERROR":
             domains_out[res[0]] = {"seq": res[1], "coords": res[2]}
         if done % 1000 == 0:
-            log(f"  {done}/{n}  found {len(domains_out)} so far")
+            log(f"  {done}/{len(items)}  found {len(domains_out)}")
 
 log(f"  {len(domains_out)} domains with coordinates")
 
 
 # ── Save .npz ─────────────────────────────────────────────────────────────────
 log(f"=== Saving {OUT_PATH.name} ===")
-domain_ids = list(domains_out.keys())
-sequences  = [domains_out[d]["seq"]    for d in domain_ids]
-coords_list= [domains_out[d]["coords"] for d in domain_ids]
-lengths    = np.array([len(c) for c in coords_list], dtype=np.int32)
-coords_flat= np.concatenate(coords_list, axis=0)           # (sum_L, 3) float32
+domain_ids  = list(domains_out.keys())
+sequences   = [domains_out[d]["seq"]    for d in domain_ids]
+coords_list = [domains_out[d]["coords"] for d in domain_ids]
+lengths     = np.array([len(c) for c in coords_list], dtype=np.int32)
+coords_flat = np.concatenate(coords_list, axis=0)
 
 np.savez_compressed(
     str(OUT_PATH),
@@ -191,7 +198,6 @@ if not args.no_upload:
     log(f"  → {DRIVE_DEST}")
     result = subprocess.run(
         ["rclone", "copyto", str(OUT_PATH), DRIVE_DEST, "--progress"],
-        capture_output=False,
     )
     if result.returncode == 0:
         log("  Upload complete.")
