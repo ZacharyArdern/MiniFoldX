@@ -322,14 +322,28 @@ ESMC_ATTN   = 648    # 36 layers × 18 heads
 
 fc_s = nn.Sequential(nn.Linear(ESMC_HIDDEN, C_S), nn.ReLU(), nn.Linear(C_S, C_S)).cuda()  # fp32
 fc_z = nn.Sequential(nn.Linear(ESMC_ATTN,  C_Z), nn.ReLU(), nn.Linear(C_Z, C_Z)).cuda()   # fp32
+
+# Zero-init output layers so trunk sees near-zero perturbation at step 0
+nn.init.zeros_(fc_s[-1].weight); nn.init.zeros_(fc_s[-1].bias)
+nn.init.zeros_(fc_z[-1].weight); nn.init.zeros_(fc_z[-1].bias)
+
 log(f"  fc_s params: {sum(p.numel() for p in fc_s.parameters()):,}")
 log(f"  fc_z params: {sum(p.numel() for p in fc_z.parameters()):,}")
 
+WARMUP_STEPS = 500
+total_steps  = args.epochs * len(train_ids)
 optimizer = torch.optim.AdamW(
     list(fc_s.parameters()) + list(fc_z.parameters()),
     lr=args.lr, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer, T_max=args.epochs * len(train_ids))
+
+def lr_lambda(step):
+    if step < WARMUP_STEPS:
+        return step / WARMUP_STEPS
+    progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
+    return 0.5 * (1 + math.cos(math.pi * progress))
+
+import math
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # ── 10. Forward + loss helpers ────────────────────────────────────────────────
