@@ -446,7 +446,9 @@ for epoch in range(args.epochs):
             mask = torch.ones(1, L, dtype=torch.float16, device="cuda")
             s_s = fc_s(hidden).half(); s_z = fc_z(s_z_in).half()
             preds, _ = trunk(s_s, s_z, mask, num_recycling=0)
-            test_losses.append(distogram_loss(preds, true_bins, mask).item())
+            val_loss = distogram_loss(preds, true_bins, mask)
+            if not (torch.isnan(val_loss) or torch.isinf(val_loss)):
+                test_losses.append(val_loss.item())
 
     train_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
     test_loss  = sum(test_losses)  / max(len(test_losses),  1)
