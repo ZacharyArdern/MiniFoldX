@@ -137,9 +137,11 @@ def run(
 @click.option("--max-len",    default=300,   show_default=True)
 @click.option("--min-len",    default=40,    show_default=True)
 @click.option("--ckpt-every", default=500,   show_default=True)
-@click.option("--timeout",    default=7200,  show_default=True)
+@click.option("--timeout",    default=14400, show_default=True)
 @click.option("--out", "out_dest", default="both",
               type=click.Choice(["both", "pwd", "drive"]), show_default=True)
+@click.option("--resume-job", default="", show_default=False,
+              help="Job ID to resume from (downloads its checkpoints before training).")
 def train(
     gpu: str,
     epochs: int,
@@ -149,6 +151,7 @@ def train(
     ckpt_every: int,
     timeout: int,
     out_dest: str,
+    resume_job: str,
 ) -> None:
     """Train fc_s / fc_z for ESMC 600M → MiniFoldX 12L on CATH S20."""
     check_deps()
@@ -174,7 +177,7 @@ def train(
         script = make_training_script(
             job_id=job_id, epochs=epochs, lr=lr, max_len=max_len,
             min_len=min_len, ckpt_every=ckpt_every, out_dest=out_dest,
-            has_drive=drive,
+            has_drive=drive, resume_job=resume_job,
         )
 
         if drive:

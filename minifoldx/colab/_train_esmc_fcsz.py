@@ -43,6 +43,8 @@ parser.add_argument("--weights",   type=str,   default="/content/weights")
 parser.add_argument("--data",      type=str,   default="/content/cath_s20")
 parser.add_argument("--no-drive",  action="store_true", help="Skip Drive checkpointing")
 parser.add_argument("--ckpt-every",type=int,   default=500,   help="Checkpoint every N steps")
+parser.add_argument("--resume",    type=str,   default=None,
+                    help="Path to .pt checkpoint, or 'auto' to find latest in OUT_DIR")
 args = parser.parse_args()
 
 OUT_DIR     = Path(args.out);     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -345,6 +347,36 @@ def lr_lambda(step):
 import math
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+# ── Resume from checkpoint ────────────────────────────────────────────────────
+start_epoch = 0
+global_step = 0
+
+if args.resume:
+    if args.resume == "auto":
+        pts = sorted(OUT_DIR.glob("fcsz_step*.pt"),
+                     key=lambda p: int(p.stem.replace("fcsz_step", "")))
+        resume_path = pts[-1] if pts else None
+    else:
+        resume_path = Path(args.resume)
+
+    if resume_path and resume_path.exists():
+        log(f"=== Resuming from {resume_path.name} ===")
+        ckpt = torch.load(str(resume_path), map_location="cpu")
+        fc_s.load_state_dict(ckpt["fc_s"])
+        fc_z.load_state_dict(ckpt["fc_z"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        else:
+            for _ in range(ckpt.get("step", 0)):
+                scheduler.step()
+        global_step = ckpt.get("step", 0)
+        start_epoch = ckpt.get("epoch", 0) + 1
+        log(f"  Resuming from epoch {start_epoch+1}, step {global_step}")
+    else:
+        log(f"  WARNING: no checkpoint found for --resume, starting fresh")
+
 
 # ── 10. Forward + loss helpers ────────────────────────────────────────────────
 def esmc_forward(seq: str):
@@ -384,11 +416,12 @@ def distogram_loss(preds: torch.Tensor, true_bins: torch.Tensor, mask: torch.Ten
 # ── 11. Training loop ─────────────────────────────────────────────────────────
 log("=== Training ===")
 log(f"  Epochs: {args.epochs}  LR: {args.lr}  Domains: {len(train_ids)} train / {len(test_ids)} test")
+if start_epoch > 0:
+    log(f"  Resuming from epoch {start_epoch+1}/{args.epochs}, step {global_step}")
 
 best_test_loss = float("inf")
-global_step    = 0
 
-for epoch in range(args.epochs):
+for epoch in range(start_epoch, args.epochs):
     fc_s.train(); fc_z.train()
     random.shuffle(train_ids)
     epoch_losses = []
@@ -439,6 +472,8 @@ for epoch in range(args.epochs):
         if global_step % args.ckpt_every == 0:
             ckpt = OUT_DIR / f"fcsz_step{global_step}.pt"
             torch.save({"fc_s": fc_s.state_dict(), "fc_z": fc_z.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
                         "step": global_step, "epoch": epoch}, str(ckpt))
             log(f"  Checkpoint saved: {ckpt.name}")
 

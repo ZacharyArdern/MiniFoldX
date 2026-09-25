@@ -334,6 +334,7 @@ def make_training_script(
     ckpt_every: int = 500,
     out_dest: str = "both",
     has_drive: bool = True,
+    resume_job: str = "",
 ) -> str:
     """Return a Python script that trains fc_s/fc_z for ESMC 600M on a Colab VM."""
     import subprocess as _sp
@@ -413,8 +414,15 @@ run("uv","pip","install","--system","-q",
     "safetensors","huggingface_hub[hf_xet]","einops",
     "dm-tree","ml-collections","modelcif","edit_distance","fair-esm")
 
+RESUME_JOB = "{resume_job}"
+if RESUME_JOB and HAS_DRIVE:
+    log("=== Downloading resume checkpoint from Drive ===")
+    rclone_copy(f"{{JOBS_REMOTE}}/{{RESUME_JOB}}/outputs", OUTPUTS)
+    log(f"  Checkpoints from job {{RESUME_JOB}} ready in {{OUTPUTS}}")
+
 log("=== Launching training ===")
 TRAIN_SCRIPT = os.path.join(MINIFOLDX_DIR, "minifoldx", "colab", "_train_esmc_fcsz.py")
+resume_flag = ["--resume", "auto"] if RESUME_JOB else []
 run(sys.executable, TRAIN_SCRIPT,
     "--epochs", "{epochs}",
     "--lr",     "{lr}",
@@ -422,7 +430,8 @@ run(sys.executable, TRAIN_SCRIPT,
     "--min-len","{min_len}",
     "--ckpt-every","{ckpt_every}",
     "--weights",WEIGHTS,
-    "--out",    OUTPUTS)
+    "--out",    OUTPUTS,
+    *resume_flag)
 
 log("=== Saving results to Drive ===")
 if HAS_DRIVE and OUT_DEST in ("both","drive"):
