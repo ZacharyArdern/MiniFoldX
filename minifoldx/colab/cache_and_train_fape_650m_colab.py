@@ -281,6 +281,8 @@ while global_step < N_STEPS:
         log(f"  SKIP aatype {did}: {e}"); continue
 
     if attn_flat.shape[2] != L or true_ca.shape[0] != L:
+        if global_step == 0:
+            log(f"  Shape mismatch {did}: attn_flat L={attn_flat.shape[2]}, true_ca L={true_ca.shape[0]}, seq L={L}")
         continue
 
     mask   = seq_mask.unsqueeze(0)
@@ -296,6 +298,8 @@ while global_step < N_STEPS:
     loss_plddt  = lddt_ce_loss(plddt_logits, pred_ca, true_ca)
     loss        = loss_struct + PLDDT_WEIGHT * loss_plddt
     if torch.isnan(loss) or torch.isinf(loss):
+        if global_step == 0:
+            log(f"  NaN/Inf loss on {did}: struct={loss_struct.item():.3f} plddt={loss_plddt.item():.3f}")
         continue
 
     optimizer.zero_grad()
