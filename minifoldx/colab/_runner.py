@@ -329,6 +329,8 @@ def make_fape_training_script(
     job_id: str,
     out_dest: str = "both",
     has_drive: bool = True,
+    resume_job: str = "",
+    reset_lr: bool = False,
 ) -> str:
     """Return a wrapper script that pulls Drive cache, then runs cache_and_train_fape_650m_colab.py."""
     import subprocess as _sp
@@ -347,6 +349,8 @@ JOBS_REMOTE    = "{JOBS_REMOTE}"
 HAS_DRIVE      = {has_drive}
 OUT_DEST       = "{out_dest}"
 RCLONE_VERSION = "{RCLONE_VERSION}"
+RESUME_JOB     = "{resume_job}"
+RESET_LR       = {reset_lr}
 
 WEIGHTS = "/content/weights"
 OUTPUTS = "/content/outputs"
@@ -406,6 +410,24 @@ else:
     if HAS_DRIVE:
         run("tar","-czf",MINIFOLD_TAR,"-C","/content","MiniFoldX")
         open(MINIFOLD_STAMP,"w").write("{_commit}")
+
+if RESUME_JOB and HAS_DRIVE:
+    log(f"=== Downloading resume checkpoint from job {{RESUME_JOB}} ===")
+    os.makedirs(OUTPUTS, exist_ok=True)
+    r = subprocess.run(["rclone","copy",f"{{JOBS_REMOTE}}/{{RESUME_JOB}}/outputs",
+                        OUTPUTS,"--include","*.pt","--progress"])
+    if r.returncode not in (0, 3):
+        log(f"Warning: rclone resume download exited {{r.returncode}}")
+    pts = [f for f in os.listdir(OUTPUTS) if f.endswith(".pt")] if os.path.isdir(OUTPUTS) else []
+    log(f"  {{len(pts)}} checkpoint file(s) ready in {{OUTPUTS}}")
+    if RESET_LR:
+        import torch as _torch
+        resume_pt = os.path.join(OUTPUTS, "fcsz_fape_650m_resume.pt")
+        if os.path.exists(resume_pt):
+            ckpt = _torch.load(resume_pt, map_location="cpu")
+            ckpt["step"] = 0
+            _torch.save(ckpt, resume_pt)
+            log("  Reset step to 0 in resume checkpoint (LR scheduler will restart).")
 
 TRAIN_SCRIPT = os.path.join(MINIFOLDX_DIR, "minifoldx", "colab", "cache_and_train_fape_650m_colab.py")
 run(sys.executable, TRAIN_SCRIPT)

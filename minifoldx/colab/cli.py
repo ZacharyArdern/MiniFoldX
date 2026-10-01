@@ -204,14 +204,19 @@ def train(
 
 
 @main.command(name="train-fape")
-@click.option("--gpu",     default="G4",   type=click.Choice(GPU_CHOICES), show_default=True)
-@click.option("--npz",     "npz_path",     default=None,
+@click.option("--gpu",        default="G4",   type=click.Choice(GPU_CHOICES), show_default=True)
+@click.option("--npz",        "npz_path",     default=None,
               help="Local path to cath_s20_coords.npz (only needed if not already on Drive).")
-@click.option("--timeout", default=28800,  show_default=True,
+@click.option("--timeout",    default=28800,  show_default=True,
               help="Max seconds to wait (default 8 h).")
-@click.option("--out",     "out_dest",     default="both",
+@click.option("--out",        "out_dest",     default="both",
               type=click.Choice(["both", "pwd", "drive"]), show_default=True)
-def train_fape(gpu: str, npz_path: str | None, timeout: int, out_dest: str) -> None:
+@click.option("--resume-job", default="",     show_default=False,
+              help="Job ID to resume from (downloads its checkpoint before training).")
+@click.option("--reset-lr",   is_flag=True,
+              help="Reset LR scheduler to step 0 when resuming (recommended for long runs).")
+def train_fape(gpu: str, npz_path: str | None, timeout: int, out_dest: str,
+               resume_job: str, reset_lr: bool) -> None:
     """Train ESM2-650M fc_s/fc_z + bb_update + pLDDT head via Ca pairwise distance loss."""
     check_deps()
 
@@ -220,7 +225,10 @@ def train_fape(gpu: str, npz_path: str | None, timeout: int, out_dest: str) -> N
 
     click.echo(f"Job ID  : {job_id}")
     click.echo(f"GPU     : {gpu}  |  timeout: {timeout}s")
-    click.echo(f"Output  : {out_dest}\n")
+    click.echo(f"Output  : {out_dest}")
+    if resume_job:
+        click.echo(f"Resume  : {resume_job}  (reset-lr={reset_lr})")
+    click.echo("")
 
     colab("new", "--gpu", gpu, "-s", session)
 
@@ -247,7 +255,8 @@ def train_fape(gpu: str, npz_path: str | None, timeout: int, out_dest: str) -> N
                   input="import os; os.makedirs('/content/weights', exist_ok=True)", text=True)
             colab("upload", "-s", session, npz_path, "/content/weights/cath_s20_coords.npz")
 
-        script = make_fape_training_script(job_id=job_id, out_dest=out_dest, has_drive=drive)
+        script = make_fape_training_script(job_id=job_id, out_dest=out_dest, has_drive=drive,
+                                           resume_job=resume_job, reset_lr=reset_lr)
 
         with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
             f.write(script)
