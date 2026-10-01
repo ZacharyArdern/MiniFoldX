@@ -235,8 +235,8 @@ def fill_buffer(seq_slice):
 # ── 11. Training loop ─────────────────────────────────────────────────────────
 log(f"Training  N_STEPS={N_STEPS}  LR={LR}  buffer={BUFFER_SIZE}  steps_per_buf={STEPS_PER_BUFFER}")
 
-random.shuffle(did_list)
 pairs      = list(zip(did_list, seq_list))
+random.shuffle(pairs)
 pair_iter  = iter(pairs)
 losses     = []
 global_step = start_step
