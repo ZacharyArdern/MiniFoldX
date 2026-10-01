@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-Colab: cache ESM2-650M embeddings then train fc_s + fc_z with Ca distance loss.
+Colab: train fc_s + fc_z + bb_update + pLDDT head with Ca distance loss.
 
-Phase 1 — Cache: runs ESM2-650M on 8k CATH S20 sequences, saves h (fp16) +
-  attention maps (int8) to /content/cache_650m/. Skips already-cached sequences
-  so re-running after interruption is safe.
+ESM2-650M stays loaded on GPU throughout. Embeddings are buffered in GPU memory
+(BUFFER_SIZE sequences at a time), with STEPS_PER_BUFFER gradient steps per buffer
+before refreshing. No disk caching.
 
-Phase 2 — Train: fc_s (1280→1024) + fc_z (660→128), frozen trunk + SM,
-  Ca pairwise distance loss vs CATH S20 coords. Resumes from checkpoint if present.
-
-Inputs:  /content/weights/cath_s20_coords.npz  (upload before running)
+Inputs:  /content/weights/cath_s20_coords.npz
 Outputs: /content/outputs/fcsz_fape_650m.pt
          /content/outputs/fcsz_fape_650m_step<N>.pt  (every SAVE_EVERY steps)
-         /content/outputs/fcsz_fape_650m_resume.pt   (for session recovery)
+         /content/outputs/fcsz_fape_650m_resume.pt
 """
 
 import os, random, math, time, subprocess, sys, types
@@ -37,7 +34,6 @@ run("uv", "pip", "install", "--system", "-q",
 # ── 2. Paths + config ─────────────────────────────────────────────────────────
 WEIGHTS_DIR = Path("/content/weights"); WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 OUT_DIR     = Path("/content/outputs"); OUT_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR   = Path("/content/cache_650m"); CACHE_DIR.mkdir(parents=True, exist_ok=True)
 NPZ_PATH    = WEIGHTS_DIR / "cath_s20_coords.npz"
 CKPT_PATH   = WEIGHTS_DIR / "minifold_12L.safetensors"
 OUT_PATH    = OUT_DIR / "fcsz_fape_650m.pt"
@@ -48,14 +44,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
-N_CACHE    = 8000
-N_STEPS    = 30000
-LR         = 3e-4
-WARMUP     = 1000
-SEED       = 42
-SAVE_EVERY = 3000
-RECYCLING  = 1
+DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
+N_SEQS          = 8000   # sequences sampled from CATH S20
+N_STEPS         = 30000
+LR              = 3e-4
+WARMUP          = 1000
+SEED            = 42
+SAVE_EVERY      = 3000
+RECYCLING       = 1
+BUFFER_SIZE     = 1000   # sequences held in GPU memory at once
+STEPS_PER_BUFFER = 80    # gradient steps per buffer before refreshing
 
 random.seed(SEED); torch.manual_seed(SEED)
 T0 = time.time()
@@ -66,70 +64,24 @@ if not NPZ_PATH.exists():
 
 # ── 3. Load CATH S20 ──────────────────────────────────────────────────────────
 log("Loading CATH S20 ...")
-data     = np.load(str(NPZ_PATH), allow_pickle=True)
-all_ids  = data["domain_ids"].tolist()
+data    = np.load(str(NPZ_PATH), allow_pickle=True)
+all_ids = data["domain_ids"].tolist()
 all_seqs = data["sequences"].tolist()
 lengths  = data["lengths"]
 offsets  = np.concatenate([[0], np.cumsum(lengths)])
 cf       = data["coords_flat"]
 
-ca_map      = {did: torch.tensor(cf[offsets[i]:offsets[i+1]], dtype=torch.float32)
-               for i, did in enumerate(all_ids)}
-seq_lookup  = dict(zip(all_ids, all_seqs))
+ca_map     = {did: torch.tensor(cf[offsets[i]:offsets[i+1]], dtype=torch.float32)
+              for i, did in enumerate(all_ids)}
+seq_lookup = dict(zip(all_ids, all_seqs))
 
 random.seed(SEED)
-indices  = random.sample(range(len(all_ids)), N_CACHE)
+indices  = random.sample(range(len(all_ids)), N_SEQS)
 did_list = [all_ids[i] for i in indices]
 seq_list = [all_seqs[i] for i in indices]
-log(f"  {len(all_ids)} total  sampled {N_CACHE}  mean_len={sum(len(s) for s in seq_list)//N_CACHE}")
+log(f"  {len(all_ids)} total  sampled {N_SEQS}  mean_len={sum(len(s) for s in seq_list)//N_SEQS}")
 
-ids_file = CACHE_DIR / "domain_ids.txt"
-if not ids_file.exists():
-    with open(str(ids_file), "w") as f:
-        f.write("\n".join(did_list))
-
-# ── 4. Phase 1: cache ESM2-650M ───────────────────────────────────────────────
-already_cached = sum(1 for d in did_list if (CACHE_DIR / f"{d}.pt").exists())
-log(f"Phase 1: caching  ({already_cached}/{N_CACHE} already done)")
-
-if already_cached < N_CACHE:
-    from transformers import EsmModel, EsmTokenizer
-    log("  Loading ESM2-650M ...")
-    tok = EsmTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D")
-    esm = EsmModel.from_pretrained("facebook/esm2_t33_650M_UR50D",
-                                    attn_implementation="eager").half().to(DEVICE).eval()
-    for p in esm.parameters(): p.requires_grad_(False)
-
-    def to_int8(x):
-        scale = x.abs().max().item() or 1.0
-        return (x / scale * 127).round().clamp(-127, 127).to(torch.int8), scale
-
-    skipped = total_bytes = 0
-    for step, (did, seq) in enumerate(zip(did_list, seq_list)):
-        out_path = CACHE_DIR / f"{did}.pt"
-        if out_path.exists():
-            continue
-        try:
-            ids = tok(seq, return_tensors="pt")["input_ids"].to(DEVICE)
-            with torch.no_grad():
-                out = esm(input_ids=ids, output_attentions=True)
-            L    = len(seq)
-            h    = out.last_hidden_state[0, 1:-1].half().cpu()               # (L, 1280)
-            attn = torch.stack(out.attentions, dim=1)[0, :, :, 1:-1, 1:-1]  # (33, 20, L, L)
-            q, scale = to_int8(attn.half().float().cpu())
-            torch.save({"h": h, "attn_q": q, "attn_scale": scale, "L": L}, str(out_path))
-            total_bytes += os.path.getsize(str(out_path))
-        except Exception as e:
-            log(f"    SKIP {did}: {e}"); skipped += 1; continue
-        if (step + 1) % 500 == 0:
-            log(f"    {step+1}/{N_CACHE}  cache={total_bytes/1e9:.1f}GB  skipped={skipped}")
-
-    log(f"  Cache done  total={total_bytes/1e9:.1f}GB  skipped={skipped}")
-    del esm; torch.cuda.empty_cache() if DEVICE == "cuda" else None
-else:
-    log("  All sequences already cached, skipping ESM2-650M inference")
-
-# ── 5. ESM v3 mock (needed by MiniFoldX imports) ──────────────────────────────
+# ── 4. ESM v3 mock (needed by MiniFoldX imports) ──────────────────────────────
 import esm as _esm_mod
 _dm = types.ModuleType("esm.data")
 class _FA:
@@ -139,7 +91,7 @@ _dm.Alphabet = _FA
 _esm_mod.data = _dm
 sys.modules["esm.data"] = _dm
 
-# ── 6. Download MiniFoldX checkpoint ─────────────────────────────────────────
+# ── 5. Download MiniFoldX checkpoint ──────────────────────────────────────────
 if not CKPT_PATH.exists():
     log("Downloading MiniFoldX 12L weights ...")
     from huggingface_hub import hf_hub_download
@@ -147,6 +99,15 @@ if not CKPT_PATH.exists():
     hf_hub_download(repo_id="z-ardern/MiniFoldX_weights",
                     filename="minifold_12L.safetensors",
                     local_dir=str(WEIGHTS_DIR), local_dir_use_symlinks=False)
+
+# ── 6. Load ESM2-650M (stays on GPU throughout) ───────────────────────────────
+from transformers import EsmModel, EsmTokenizer
+log("Loading ESM2-650M ...")
+tok = EsmTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D")
+esm = EsmModel.from_pretrained("facebook/esm2_t33_650M_UR50D",
+                                attn_implementation="eager").half().to(DEVICE).eval()
+for p in esm.parameters(): p.requires_grad_(False)
+log("  ESM2-650M ready")
 
 # ── 7. Load frozen trunk + SM ─────────────────────────────────────────────────
 log("Loading MiniFoldX trunk + SM ...")
@@ -178,13 +139,13 @@ sm.load_state_dict({k.replace("model.structure_module.",""): v
                     for k,v in sd.items() if "structure_module" in k})
 sm = sm.to(DEVICE).eval()
 for p in sm.parameters(): p.requires_grad_(False)
-for p in sm.bb_update.parameters(): p.requires_grad_(True)  # unfreeze bb_update only
+for p in sm.bb_update.parameters(): p.requires_grad_(True)
 
 plddt_head = PerResidueLDDTCaPredictor(no_bins=50, c_in=1024, c_hidden=128)
 plddt_head.load_state_dict({k.replace("model.aux_heads.plddt.", ""): v
                              for k, v in sd.items() if "aux_heads.plddt" in k})
 plddt_head = plddt_head.to(DEVICE)
-for p in plddt_head.parameters(): p.requires_grad_(True)  # fully trainable
+for p in plddt_head.parameters(): p.requires_grad_(True)
 
 cfg = model_config("initial_training", train=False, low_prec=False, long_sequence_inference=False).data
 
@@ -194,7 +155,7 @@ def get_aatype(seq):
 
 log("  Trunk + SM ready")
 
-# ── 8. Trainable fc_s + fc_z ─────────────────────────────────────────────────
+# ── 8. Trainable fc_s + fc_z ──────────────────────────────────────────────────
 fc_s = nn.Sequential(nn.Linear(1280, 1024), nn.ReLU(), nn.Linear(1024, 1024)).to(DEVICE)
 fc_z = nn.Sequential(nn.Linear(660,  128),  nn.ReLU(), nn.Linear(128,  128)).to(DEVICE)
 
@@ -224,7 +185,7 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 for _ in range(start_step):
     scheduler.step()
 
-# ── 9. Loss + helpers ─────────────────────────────────────────────────────────
+# ── 9. Loss helpers ───────────────────────────────────────────────────────────
 def ca_dist_loss(pred_ca, true_ca, clamp_ang=20.0):
     def pw(x):
         d = x.unsqueeze(0) - x.unsqueeze(1)
@@ -233,7 +194,6 @@ def ca_dist_loss(pred_ca, true_ca, clamp_ang=20.0):
                       pw(true_ca).clamp(max=clamp_ang))
 
 def compute_lddt_ca(pred_ca, true_ca, cutoff=15.0, n_bins=50):
-    """Per-residue lDDT-Cα as bin indices for cross-entropy. Returns (L,) int64."""
     with torch.no_grad():
         pred_d = torch.cdist(pred_ca.unsqueeze(0), pred_ca.unsqueeze(0))[0]
         true_d = torch.cdist(true_ca.unsqueeze(0), true_ca.unsqueeze(0))[0]
@@ -241,68 +201,96 @@ def compute_lddt_ca(pred_ca, true_ca, cutoff=15.0, n_bins=50):
         diff   = (pred_d - true_d).abs()
         preserved = sum((diff < t).float() * mask for t in [0.5, 1.0, 2.0, 4.0])
         n_contacts = mask.float().sum(dim=1).clamp(min=1e-6)
-        lddt   = preserved.sum(dim=1) / (4.0 * n_contacts)   # (L,) in [0, 1]
-        return (lddt * n_bins).long().clamp(0, n_bins - 1)   # bin indices
+        lddt   = preserved.sum(dim=1) / (4.0 * n_contacts)
+        return (lddt * n_bins).long().clamp(0, n_bins - 1)
 
 def lddt_ce_loss(plddt_logits, pred_ca, true_ca):
-    """Cross-entropy loss between pLDDT logits and true per-residue lDDT bins."""
-    bin_idx = compute_lddt_ca(pred_ca.detach(), true_ca)   # no grad through true labels
-    logits  = plddt_logits[0] if plddt_logits.dim() == 3 else plddt_logits  # (L, 50)
+    bin_idx = compute_lddt_ca(pred_ca.detach(), true_ca)
+    logits  = plddt_logits[0] if plddt_logits.dim() == 3 else plddt_logits
     return F.cross_entropy(logits, bin_idx)
 
-PLDDT_WEIGHT = 0.01   # keeps structural loss dominant
+PLDDT_WEIGHT = 0.01
 
-def from_int8(q, scale):
-    return q.float() * (scale / 127.0)
-
-# ── 10. Load cached domain list ───────────────────────────────────────────────
-with open(str(ids_file)) as f:
-    cached_ids = [l.strip() for l in f if l.strip()]
-cached_ids = [d for d in cached_ids if (CACHE_DIR / f"{d}.pt").exists() and d in ca_map]
-log(f"Phase 2: training  {len(cached_ids)} sequences available  start_step={start_step}")
+# ── 10. Buffer fill ───────────────────────────────────────────────────────────
+def fill_buffer(seq_slice):
+    """Run ESM2 on seq_slice, return list of (did, h, attn_flat, true_ca, seq) dicts."""
+    buf = []
+    skipped = 0
+    for did, seq in seq_slice:
+        try:
+            ids = tok(seq, return_tensors="pt")["input_ids"].to(DEVICE)
+            with torch.no_grad():
+                out = esm(input_ids=ids, output_attentions=True)
+            L        = len(seq)
+            h        = out.last_hidden_state[0, 1:-1].float().unsqueeze(0)          # (1, L, 1280)
+            attn     = torch.stack(out.attentions, dim=1)[0, :, :, 1:-1, 1:-1]     # (33, 20, L, L)
+            attn_flat = attn.float().permute(2, 3, 0, 1).reshape(1, L, L, 660)     # (1, L, L, 660)
+            true_ca  = ca_map[did].to(DEVICE)                                       # (L, 3)
+            buf.append({"did": did, "seq": seq, "h": h, "attn_flat": attn_flat,
+                        "true_ca": true_ca, "L": L})
+        except Exception as e:
+            log(f"  SKIP {did}: {e}"); skipped += 1
+    return buf, skipped
 
 # ── 11. Training loop ─────────────────────────────────────────────────────────
-random.shuffle(cached_ids)
-seq_iter    = iter(cached_ids)
-losses      = []
-global_step = start_step
+log(f"Training  N_STEPS={N_STEPS}  LR={LR}  buffer={BUFFER_SIZE}  steps_per_buf={STEPS_PER_BUFFER}")
 
-log(f"  N_STEPS={N_STEPS}  LR={LR}  warmup={WARMUP}  recycling={RECYCLING}  save_every={SAVE_EVERY}")
+random.shuffle(did_list)
+pairs      = list(zip(did_list, seq_list))
+pair_iter  = iter(pairs)
+losses     = []
+global_step = start_step
+buf        = []
+buf_fill_count = 0
 
 while global_step < N_STEPS:
-    try:
-        did = next(seq_iter)
-    except StopIteration:
-        random.shuffle(cached_ids)
-        seq_iter = iter(cached_ids)
-        did = next(seq_iter)
+    # Refill buffer when empty
+    if not buf:
+        slice_pairs = []
+        for _ in range(BUFFER_SIZE):
+            try:
+                slice_pairs.append(next(pair_iter))
+            except StopIteration:
+                random.shuffle(pairs)
+                pair_iter = iter(pairs)
+                slice_pairs.append(next(pair_iter))
+        buf_fill_count += 1
+        log(f"  Filling buffer {buf_fill_count} ({len(slice_pairs)} seqs) ...")
+        buf, skipped = fill_buffer(slice_pairs)
+        log(f"  Buffer ready: {len(buf)} sequences  (skipped {skipped})")
+        if not buf:
+            continue
+        buf_step = 0
 
-    seq = seq_lookup.get(did)
-    if seq is None:
-        continue
+    # Sample from buffer
+    item = buf[buf_step % len(buf)]
+    buf_step += 1
+    if buf_step >= STEPS_PER_BUFFER:
+        buf = []  # trigger refill next iteration
+
+    did      = item["did"]
+    seq      = item["seq"]
+    h        = item["h"]
+    attn_flat = item["attn_flat"]
+    true_ca  = item["true_ca"]
+    L        = item["L"]
 
     try:
-        cached = torch.load(str(CACHE_DIR / f"{did}.pt"), map_location="cpu")
-        h         = cached["h"].float().unsqueeze(0).to(DEVICE)       # (1, L, 1280)
-        L         = cached["L"]
-        attn      = from_int8(cached["attn_q"], cached["attn_scale"]) # (33, 20, L, L)
-        attn_flat = attn.permute(2, 3, 0, 1).reshape(1, L, L, 660).to(DEVICE)
-        true_ca   = ca_map[did].to(DEVICE)                            # (L, 3)
         aatype, seq_mask = get_aatype(seq)
     except Exception as e:
-        log(f"  SKIP {did}: {e}"); continue
+        log(f"  SKIP aatype {did}: {e}"); continue
 
     if attn_flat.shape[2] != L or true_ca.shape[0] != L:
         continue
 
-    mask = seq_mask.unsqueeze(0)
-    s_s  = fc_s(h)
-    s_z  = fc_z(attn_flat)
+    mask   = seq_mask.unsqueeze(0)
+    s_s    = fc_s(h)
+    s_z    = fc_z(attn_flat)
     _, s_z_out = trunk(s_s, s_z, mask, num_recycling=RECYCLING)
     single     = sz_proj(s_z_out, s_s, mask[:, None, :] * mask[:, :, None])
-    sm_out         = sm(s=single, z=s_z_out, aatype=aatype, mask=seq_mask)
-    pred_ca        = sm_out["positions"][-1, 0, :, 1, :]               # (L, 3) Ca atom14
-    plddt_logits   = plddt_head(sm_out["single"])                      # (1, L, 50)
+    sm_out       = sm(s=single, z=s_z_out, aatype=aatype, mask=seq_mask)
+    pred_ca      = sm_out["positions"][-1, 0, :, 1, :]
+    plddt_logits = plddt_head(sm_out["single"])
 
     loss_struct = ca_dist_loss(pred_ca, true_ca)
     loss_plddt  = lddt_ce_loss(plddt_logits, pred_ca, true_ca)
