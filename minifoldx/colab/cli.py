@@ -19,6 +19,7 @@ Drive layout (under My Drive):
 """
 
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -196,6 +197,84 @@ def train(
 
         colab("exec", "-s", session, "-f", script_path, "--timeout", str(timeout))
         click.echo("\nTraining complete.")
+
+    finally:
+        import subprocess as _sp
+        _sp.run(["colab", "stop", "-s", session])
+
+
+@main.command(name="train-fape")
+@click.option("--gpu",     default="G4",   type=click.Choice(GPU_CHOICES), show_default=True)
+@click.option("--npz",     "npz_path",     default=None,
+              help="Local path to cath_s20_coords.npz (only needed if not already on Drive).")
+@click.option("--timeout", default=28800,  show_default=True,
+              help="Max seconds to wait (default 8 h).")
+@click.option("--out",     "out_dest",     default="both",
+              type=click.Choice(["both", "pwd", "drive"]), show_default=True)
+def train_fape(gpu: str, npz_path: str | None, timeout: int, out_dest: str) -> None:
+    """Train ESM2-650M fc_s/fc_z + bb_update + pLDDT head via Ca pairwise distance loss."""
+    check_deps()
+
+    job_id  = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    session = f"minifold_fape_{job_id}"
+
+    click.echo(f"Job ID  : {job_id}")
+    click.echo(f"GPU     : {gpu}  |  timeout: {timeout}s")
+    click.echo(f"Output  : {out_dest}\n")
+
+    colab("new", "--gpu", gpu, "-s", session)
+
+    drive = _has_drive()
+    from ._runner import make_fape_training_script, RCLONE_CONF, HF_TOKEN_PATH, JOBS_REMOTE, rclone, _download_from_vm
+
+    try:
+        # Upload rclone credentials
+        if drive:
+            colab("exec", "-s", session, "--timeout", "10", "-f", "/dev/stdin",
+                  input="import os; os.makedirs('/root/.config/rclone', exist_ok=True)", text=True)
+            colab("upload", "-s", session, str(RCLONE_CONF), "/root/.config/rclone/rclone.conf")
+
+        if HF_TOKEN_PATH.exists():
+            colab("exec", "-s", session, "--timeout", "10", "-f", "/dev/stdin",
+                  input="import os; os.makedirs('/root/.cache/huggingface', exist_ok=True)", text=True)
+            colab("upload", "-s", session,
+                  str(HF_TOKEN_PATH), "/root/.cache/huggingface/token")
+
+        # Upload cath_s20_coords.npz if provided locally
+        if npz_path:
+            click.echo(f"Uploading {npz_path} ...")
+            colab("exec", "-s", session, "--timeout", "10", "-f", "/dev/stdin",
+                  input="import os; os.makedirs('/content/weights', exist_ok=True)", text=True)
+            colab("upload", "-s", session, npz_path, "/content/weights/cath_s20_coords.npz")
+
+        script = make_fape_training_script(job_id=job_id, out_dest=out_dest, has_drive=drive)
+
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+            f.write(script)
+            script_path = f.name
+
+        colab("exec", "-s", session, "-f", script_path, "--timeout", str(timeout))
+        click.echo("\nTraining complete.")
+
+        # Download checkpoints locally
+        out_dir = Path("./minifold_fape_results") / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if out_dest in ("both", "pwd"):
+            click.echo(f"Downloading checkpoints → {out_dir}/")
+            if drive and out_dest == "both":
+                rclone("copy", f"{JOBS_REMOTE}/{job_id}/outputs", str(out_dir), "--progress")
+            else:
+                _download_from_vm(session, "/content/outputs", out_dir)
+            pts = list(out_dir.glob("*.pt"))
+            click.echo(f"{len(pts)} checkpoint(s) downloaded.")
+
+        save_job({
+            "job_id":     job_id,
+            "type":       "train-fape",
+            "gpu":        gpu,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "results":    str(out_dir),
+        })
 
     finally:
         import subprocess as _sp
