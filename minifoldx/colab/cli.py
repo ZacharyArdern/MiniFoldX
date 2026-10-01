@@ -262,7 +262,11 @@ def train_fape(gpu: str, npz_path: str | None, timeout: int, out_dest: str) -> N
         if out_dest in ("both", "pwd"):
             click.echo(f"Downloading checkpoints → {out_dir}/")
             if drive and out_dest == "both":
-                rclone("copy", f"{JOBS_REMOTE}/{job_id}/outputs", str(out_dir), "--progress")
+                import subprocess as _sp
+                r = _sp.run(["rclone", "copy", f"{JOBS_REMOTE}/{job_id}/outputs",
+                             str(out_dir), "--progress"])
+                if r.returncode not in (0, 3):
+                    click.echo(f"Warning: rclone download exited {r.returncode}", err=True)
             else:
                 _download_from_vm(session, "/content/outputs", out_dir)
             pts = list(out_dir.glob("*.pt"))
