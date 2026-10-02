@@ -34,7 +34,8 @@ run(sys.executable, "-m", "pip", "install", "-q", "uv")
 run("uv", "pip", "install", "--system", "-q",
     "git+https://github.com/ZacharyArdern/MiniFoldX.git#subdirectory=minifoldx/pytorch",
     "safetensors", "huggingface_hub[hf_xet]", "einops",
-    "dm-tree", "ml-collections", "modelcif", "edit_distance", "fair-esm", "tmtools")
+    "dm-tree", "ml-collections", "modelcif", "edit_distance", "fair-esm", "tmtools",
+    "git+https://github.com/evolutionaryScale/esm.git")
 
 WEIGHTS_DIR  = Path("/content/weights");  WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUTS_DIR  = Path("/content/outputs");  OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
