@@ -207,7 +207,8 @@ if BACKBONE == "esm2_650m":
         return h, attn_flat
 
 elif BACKBONE == "esmc_600m":
-    from esm.models.esmc import ESMC, EsmSequenceTokenizer
+    from esm.models.esmc import ESMC
+    from esm.tokenization import EsmSequenceTokenizer
     log("Loading ESMC-600M ...")
     _esmc_tok = EsmSequenceTokenizer()
     _esmc = ESMC.from_pretrained("esmc_600m").to(DEVICE).eval()
