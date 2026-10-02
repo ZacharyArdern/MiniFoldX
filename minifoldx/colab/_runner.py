@@ -531,14 +531,17 @@ else:
         open(MINIFOLD_STAMP,"w").write("{_commit}")
 
 TRAIN_SCRIPT = os.path.join(MINIFOLDX_DIR, "minifoldx", "colab", "train_trunk_colab.py")
-env = dict(os.environ,
-    BACKBONE="{backbone}",
-    STEPS_PHASE1="{steps_phase1}", STEPS_PHASE2="{steps_phase2}",
-    LR_PHASE1="{lr_phase1}", LR_PHASE2="{lr_phase2}",
-    MAX_LEN="{max_len}", RECYCLING="{recycling}", SAVE_EVERY="{save_every}")
-proc = subprocess.run([sys.executable, TRAIN_SCRIPT], env=env)
-if proc.returncode != 0:
-    raise RuntimeError(f"Training script failed with exit code {{proc.returncode}}")
+os.environ.update({{
+    "BACKBONE":      "{backbone}",
+    "STEPS_PHASE1":  "{steps_phase1}",
+    "STEPS_PHASE2":  "{steps_phase2}",
+    "LR_PHASE1":     "{lr_phase1}",
+    "LR_PHASE2":     "{lr_phase2}",
+    "MAX_LEN":       "{max_len}",
+    "RECYCLING":     "{recycling}",
+    "SAVE_EVERY":    "{save_every}",
+}})
+run(sys.executable, "-u", TRAIN_SCRIPT)
 
 log("=== Saving results to Drive ===")
 if HAS_DRIVE and OUT_DEST in ("both", "drive"):
