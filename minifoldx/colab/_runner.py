@@ -441,6 +441,114 @@ log(f"=== Done [{{(time.time()-T0)/60:.1f}} min total] ===")
 """
 
 
+def make_trunk_training_script(
+    job_id: str,
+    backbone: str = "esm2_650m",
+    steps_phase1: int = 30000,
+    steps_phase2: int = 5000,
+    lr_phase1: float = 1e-4,
+    lr_phase2: float = 1e-5,
+    max_len: int = 180,
+    recycling: int = 1,
+    save_every: int = 5000,
+    out_dest: str = "both",
+    has_drive: bool = True,
+) -> str:
+    """Wrapper script: pulls Drive weights, runs train_trunk_colab.py, pushes results."""
+    import subprocess as _sp
+    _repo   = Path(__file__).resolve().parent.parent.parent
+    _commit = _sp.run(["git", "-C", str(_repo), "rev-parse", "HEAD"],
+                      capture_output=True, text=True).stdout.strip()
+
+    return f"""\
+#!/usr/bin/env python3
+# MiniFoldX trunk training wrapper — job {job_id}  backbone={backbone}
+import subprocess, sys, os, time
+
+JOB_ID         = "{job_id}"
+BACKBONE       = "{backbone}"
+WEIGHTS_REMOTE = "{WEIGHTS_REMOTE}"
+JOBS_REMOTE    = "{JOBS_REMOTE}"
+HAS_DRIVE      = {has_drive}
+OUT_DEST       = "{out_dest}"
+RCLONE_VERSION = "{RCLONE_VERSION}"
+
+WEIGHTS = "/content/weights"
+OUTPUTS = "/content/outputs"
+VM_CACHE = os.path.join(WEIGHTS, "vm_cache")
+for d in [WEIGHTS, OUTPUTS, VM_CACHE]: os.makedirs(d, exist_ok=True)
+
+T0 = time.time()
+def log(msg): print(f"[{{time.time()-T0:6.1f}}s] {{msg}}", flush=True)
+
+def run(*cmd):
+    log("+ " + " ".join(str(c) for c in cmd))
+    proc = subprocess.Popen(list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for line in proc.stdout:
+        print(line.decode(errors="replace"), end="", flush=True)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, list(cmd))
+
+def rclone_copy(src, dst, *extra):
+    r = subprocess.run(["rclone","copy",src,dst,"--progress",
+                        "--drive-chunk-size","256M","--transfers","8","--buffer-size","256M",*extra])
+    if r.returncode not in (0, 3):
+        raise RuntimeError(f"rclone copy failed: exit {{r.returncode}}")
+
+log("=== GPU info ===")
+run("nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader")
+
+if HAS_DRIVE:
+    log("=== Installing rclone ===")
+    rclone_zip = f"/tmp/rclone-{{RCLONE_VERSION}}-linux-amd64.zip"
+    run("curl","-fsSL",f"https://github.com/rclone/rclone/releases/download/{{RCLONE_VERSION}}/rclone-{{RCLONE_VERSION}}-linux-amd64.zip","-o",rclone_zip)
+    run("unzip","-q","-o",rclone_zip,"-d","/tmp/rclone_bin")
+    run("cp",f"/tmp/rclone_bin/rclone-{{RCLONE_VERSION}}-linux-amd64/rclone","/usr/local/bin/rclone")
+    log("=== Pulling weights from Drive ===")
+    rclone_copy(WEIGHTS_REMOTE, WEIGHTS)
+
+NPZ = os.path.join(WEIGHTS, "cath_s20_backbone.npz")
+if not os.path.exists(NPZ):
+    raise FileNotFoundError(f"{{NPZ}} not found — upload to Drive at {{WEIGHTS_REMOTE}}/cath_s20_backbone.npz")
+log(f"cath_s20_backbone.npz found ({{os.path.getsize(NPZ)/1e6:.0f}} MB)")
+for split_f in ["train_ids.txt", "val_ids.txt"]:
+    p = os.path.join(WEIGHTS, split_f)
+    if not os.path.exists(p):
+        log(f"WARNING: {{p}} not found — holdout split will be skipped")
+
+# Clone MiniFoldX (use cache if commit matches)
+MINIFOLDX_DIR  = "/content/MiniFoldX"
+MINIFOLD_TAR   = os.path.join(VM_CACHE, "minifold.tar.gz")
+MINIFOLD_STAMP = os.path.join(VM_CACHE, "minifold_commit.txt")
+cached_commit  = open(MINIFOLD_STAMP).read().strip() if os.path.exists(MINIFOLD_STAMP) else ""
+if os.path.exists(MINIFOLD_TAR) and cached_commit == "{_commit}":
+    run("tar","-xzf",MINIFOLD_TAR,"-C","/content")
+else:
+    run("git","clone","--depth=1","https://github.com/ZacharyArdern/MiniFoldX.git",MINIFOLDX_DIR)
+    if HAS_DRIVE:
+        run("tar","-czf",MINIFOLD_TAR,"-C","/content","MiniFoldX")
+        open(MINIFOLD_STAMP,"w").write("{_commit}")
+
+TRAIN_SCRIPT = os.path.join(MINIFOLDX_DIR, "minifoldx", "colab", "train_trunk_colab.py")
+env = dict(os.environ,
+    BACKBONE="{backbone}",
+    STEPS_PHASE1="{steps_phase1}", STEPS_PHASE2="{steps_phase2}",
+    LR_PHASE1="{lr_phase1}", LR_PHASE2="{lr_phase2}",
+    MAX_LEN="{max_len}", RECYCLING="{recycling}", SAVE_EVERY="{save_every}")
+proc = subprocess.run([sys.executable, TRAIN_SCRIPT], env=env)
+if proc.returncode != 0:
+    raise RuntimeError(f"Training script failed with exit code {{proc.returncode}}")
+
+log("=== Saving results to Drive ===")
+if HAS_DRIVE and OUT_DEST in ("both", "drive"):
+    rclone_copy(OUTPUTS, f"{{JOBS_REMOTE}}/{{JOB_ID}}/outputs")
+    log("Results pushed to Drive.")
+
+log(f"=== Done [{{(time.time()-T0)/60:.1f}} min total] ===")
+"""
+
+
 def make_training_script(
     job_id: str,
     epochs: int = 15,
