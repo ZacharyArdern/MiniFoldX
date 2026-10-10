@@ -351,7 +351,7 @@ def prepare_input(seq, config, alphabet):
 @click.option("--cpu", "force_cpu", is_flag=True,
               help="Force CPU inference.")
 @click.option("--esm_model", type=click.Choice(["esmc_600m", "esm2_3b"]),
-              default="esmc_600m", show_default=True,
+              default="esm2_3b", show_default=True,
               help="Backbone model. esmc_600m requires --checkpoint.")
 @click.option("--max_encode_tokens", type=int, default=600,
               help="Token budget for batched ESMC encoding (esmc_600m only). Default 600.")

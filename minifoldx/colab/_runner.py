@@ -90,7 +90,8 @@ def make_job_script(
         f'    FASTA, "--out_dir", OUTPUTS, "--cache", WEIGHTS,\n'
         f'    "--checkpoint", CKPT_PATH,\n'
         f'    "--model_size", MODEL_SIZE, "--token_per_batch", str(TOKEN_PER_BATCH),\n'
-        f'    "--num_recycling", str(NUM_RECYCLING){extra_flags})'
+        f'    "--num_recycling", str(NUM_RECYCLING),\n'
+        f'    "--esm_model", "esm2_3b"{extra_flags})'
     )
 
     int8_install = (
