@@ -106,6 +106,7 @@ def _run(sequences, args, out_dir):
             seq_id, seq, model, tokenizer,
             num_recycling=args.recycling,
             max_seq_len=args.max_len,
+            early_stop=args.early_stop,
         )
         elapsed = time.perf_counter() - t0
 
@@ -139,6 +140,9 @@ def main():
     parser.add_argument("--non-quantized-ESM2", dest="non_quantized_esm2",
                         action="store_true",
                         help="Use full-precision ESM2 weights instead of int8 (~11 GB vs ~5.5 GB)")
+    parser.add_argument("--early-stop", dest="early_stop", type=float, default=None,
+                        metavar="PLDDT",
+                        help="Stop recycling early when mean pLDDT >= this value (e.g. 85)")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)

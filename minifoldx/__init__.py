@@ -115,6 +115,7 @@ def predict_sequence(
     *,
     num_recycling: int = 0,
     max_seq_len: int = 800,
+    early_stop: Optional[float] = None,
 ) -> Optional[str]:
     """Predict a single sequence and return a PDB string (or None if skipped).
 
@@ -147,6 +148,7 @@ def predict_sequence(
         seq_mask      = mask_mx,
         aatype_mx     = aatype_mx,
         num_recycling = num_recycling,
+        early_stop    = early_stop,
     )
 
     L = len(seq)
@@ -168,6 +170,7 @@ def predict_batch(
     num_recycling: int = 0,
     batch_tokens: int = 2048,
     max_seq_len: int = 800,
+    early_stop: Optional[float] = None,
 ) -> dict[str, Optional[str]]:
     """Predict a list of sequences and return {seq_id: pdb_str}.
 
@@ -218,6 +221,7 @@ def predict_batch(
                 seq_mask      = mask_mx,
                 aatype_mx     = aatype_mx,
                 num_recycling = num_recycling,
+                early_stop    = early_stop,
             )
 
             out_pos  = output["final_atom_positions"]

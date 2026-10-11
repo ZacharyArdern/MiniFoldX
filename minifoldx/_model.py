@@ -202,6 +202,52 @@ class FoldingTrunk(nn.Module):
 
         return preds, s_z_c
 
+    # ── Early-stop helpers ────────────────────────────────────────────────────
+
+    def _project(self, s_s: mx.array, s_z: mx.array, mask: mx.array):
+        """Project s_s/s_z into the trunk's working space.
+
+        Called once before the recycling loop when using external early-stop.
+        Returns (s_z_proj, pair_mask) ready for repeated _single_pass calls.
+        """
+        B, L = s_s.shape[:2]
+        pair_mask = mask[:, None, :] * mask[:, :, None]
+        residx = mx.arange(L, dtype=mx.int32)[None, :]
+        s_z_proj = mx.concatenate([
+            s_z,
+            self.seq_to_pair(s_s),
+            self.positional_embedding(residx, pair_mask),
+        ], axis=-1)
+        s_z_proj = self.projection(s_z_proj)
+        return s_z_proj, pair_mask
+
+    def _single_pass(self, s_z_proj: mx.array, pair_mask: mx.array, dists: mx.array):
+        """One recycling iteration.
+
+        Parameters
+        ----------
+        s_z_proj  : projected pair representation from _project (unchanged each pass)
+        pair_mask : (B, L, L) bool/float mask from _project
+        dists     : soft one-hot distogram from previous pass, or zeros for first pass
+
+        Returns
+        -------
+        preds   : distogram logits (B, L, L, disto_bins)
+        s_z_c   : updated pair representation (B, L, L, c_z)
+        dists   : soft one-hot for the next pass
+        """
+        try:
+            _mf = object.__getattribute__(self, '_compiled_miniformer')
+        except AttributeError:
+            _mf = self.miniformer
+        s_z_c = _mf(s_z_proj + self.recycle(dists), pair_mask)
+        x     = self.fc_out_0(s_z_c + s_z_c.transpose(0, 2, 1, 3))
+        x     = mx.maximum(x, 0)
+        preds = self.fc_out_2(x)
+        dists_idx = mx.argmax(mx.stop_gradient(preds), axis=-1)
+        dists = (mx.arange(self.disto_bins) == dists_idx[..., None]).astype(s_z_proj.dtype)
+        return preds, s_z_c, dists
+
 
 # ── Top-level model ───────────────────────────────────────────────────────────
 
@@ -450,6 +496,33 @@ class MiniFoldMLX(nn.Module):
         object.__setattr__(self.fold, '_compiled_miniformer', compiled)
         print("MiniFormer compiled with mx.compile — first call per shape pays compilation cost.")
 
+    def enable_compile_esm2(self) -> None:
+        """Wrap ESM2 forward with mx.compile for fused Metal kernel dispatch.
+
+        Compiles a wrapper that fixes repr_layers=[num_layers] and need_head_weights=True
+        (the only call path used during MiniFoldX inference).  First call per unique
+        sequence length pays the compilation cost; later calls reuse the cached graph.
+
+        NOTE: Benchmarks on Apple Silicon show this is typically SLOWER or neutral:
+          L=50: 0.41×, L=100: 0.62×, L=200: 0.91×, L=400: 1.03×
+        ESM2 inference is memory-bandwidth bound (reading ~3.5GB int8 weights per
+        forward at batch_size=1), so mx.compile's elementwise-fusion benefits don't
+        apply — the bottleneck is weight reads, not kernel dispatch overhead.
+        Not recommended for normal inference; provided for experimentation only.
+
+        Assumes sequences are never padded (single-protein batch).
+        """
+        esm_model = object.__getattribute__(self, "_esm_model")
+        num_layers = object.__getattribute__(self, "_esm_num_layers")
+        _repr_layers = [num_layers]
+
+        def _esm_forward(tokens):
+            return esm_model(tokens, repr_layers=_repr_layers, need_head_weights=True, assume_no_padding=True)
+
+        compiled_esm = mx.compile(_esm_forward)
+        object.__setattr__(self, '_compiled_esm', compiled_esm)
+        print("ESM2 compiled with mx.compile — first call per sequence length pays compilation cost.")
+
     # ── Loading ───────────────────────────────────────────────────────────────
 
     @classmethod
@@ -492,6 +565,7 @@ class MiniFoldMLX(nn.Module):
         seq_mask: mx.array | None = None,
         aatype_mx: mx.array | None = None,
         num_recycling: int = 3,
+        early_stop: float | None = None,
     ) -> dict:
         """Run structure prediction.
 
@@ -502,6 +576,7 @@ class MiniFoldMLX(nn.Module):
         aatype_mx    : (B, T) MLX int array — residue type indices
                        (required for full atom-position output)
         num_recycling : number of recycling iterations
+        early_stop   : if set, stop recycling early when mean pLDDT >= this value
 
         Returns
         -------
@@ -527,7 +602,11 @@ class MiniFoldMLX(nn.Module):
         # MLX ESM2 called without BOS/EOS produces representations identical to
         # PyTorch fair-ESM2 to numerical precision (r=1.0, max diff ~1e-5).
         t0 = time.perf_counter()
-        esm_out = esm_model(tokens_mx, repr_layers=[num_layers], need_head_weights=True)
+        try:
+            _compiled_esm = object.__getattribute__(self, '_compiled_esm')
+            esm_out = _compiled_esm(tokens_mx)
+        except AttributeError:
+            esm_out = esm_model(tokens_mx, repr_layers=[num_layers], need_head_weights=True)
         esm_repr = esm_out["representations"][num_layers]   # (B, N, embed_dim)
         esm_attn = esm_out["attentions"]                    # (B, num_layers, H, N, N)
         mx.eval(esm_repr, esm_attn)
@@ -563,47 +642,83 @@ class MiniFoldMLX(nn.Module):
         mx.eval(s_s, s_z)
         print(f"  [timing] fc_s + fc_z:        {time.perf_counter()-t0:.3f}s")
 
+        # ── Precompute pair_mask and s_s_stable (needed by both code paths) ─────
+        pair_mask  = seq_mask[:, None, :] * seq_mask[:, :, None]
+        # fp16 s_s can reach ~6500, causing combiner_0 (1280-input Linear) to overflow.
+        s_s_stable = s_s.astype(mx.float32) if s_s.dtype == mx.float16 else s_s
+
         # ── FoldingTrunk ──────────────────────────────────────────────────────
         t0 = time.perf_counter()
-        print(f"  [timing] FoldingTrunk ({num_recycling+1} recycling passes):")
-        try:
-            _fold = object.__getattribute__(self, '_compiled_fold')
-        except AttributeError:
-            _fold = self.fold
-        preds, s_z = _fold(s_s, s_z, seq_mask, num_recycling=num_recycling)
-        # fp16: clamp FoldingTrunk outputs to safe range before downstream layers
-        if s_z.dtype == mx.float16:
-            preds = mx.clip(preds, -65000, 65000)
-            s_z   = mx.clip(s_z,   -65000, 65000)
-        mx.eval(preds, s_z)
-        print(f"  [timing] FoldingTrunk total: {time.perf_counter()-t0:.3f}s")
 
-        # ── PairToSequence ────────────────────────────────────────────────────
-        t0 = time.perf_counter()
-        pair_mask = seq_mask[:, None, :] * seq_mask[:, :, None]
-        # fp16 s_s can reach ~6500, causing combiner_0 (1280-input Linear) to overflow
-        # fp16 max (~65504).  Cast s_s to fp32 here; FoldingTrunk already normalised it
-        # internally via SequenceToPair's LayerNorm so fp16 there was fine.
-        s_s_stable = s_s.astype(mx.float32) if s_s.dtype == mx.float16 else s_s
-        single = self.sz_project(s_z, s_s_stable, pair_mask)
-        mx.eval(single)
-        print(f"  [timing] PairToSequence:     {time.perf_counter()-t0:.3f}s")
+        if early_stop is None:
+            # ── Standard path: trunk handles recycling internally ─────────────
+            print(f"  [timing] FoldingTrunk ({num_recycling+1} recycling passes):")
+            try:
+                _fold = object.__getattribute__(self, '_compiled_fold')
+            except AttributeError:
+                _fold = self.fold
+            preds, s_z = _fold(s_s, s_z, seq_mask, num_recycling=num_recycling)
+            if s_z.dtype == mx.float16:
+                preds = mx.clip(preds, -65000, 65000)
+                s_z   = mx.clip(s_z,   -65000, 65000)
+            mx.eval(preds, s_z)
+            print(f"  [timing] FoldingTrunk total: {time.perf_counter()-t0:.3f}s")
 
-        # ── Structure module (MLX NN part) ────────────────────────────────────
-        # fp16: IPA dot-products overflow — cast single and s_z to fp32 first
-        t0 = time.perf_counter()
-        if single.dtype == mx.float16:
-            single = single.astype(mx.float32)
-            s_z    = s_z.astype(mx.float32)
-        sm_out = self.structure_module(single, s_z, seq_mask)
-        mx.eval(sm_out["s"], sm_out["angles"], sm_out["n_ca_c"])
-        print(f"  [timing] StructureModule:    {time.perf_counter()-t0:.3f}s")
+            # ── PairToSequence ────────────────────────────────────────────────
+            t0 = time.perf_counter()
+            single = self.sz_project(s_z, s_s_stable, pair_mask)
+            mx.eval(single)
+            print(f"  [timing] PairToSequence:     {time.perf_counter()-t0:.3f}s")
 
-        # ── pLDDT (stays in MLX) ──────────────────────────────────────────────
-        t0 = time.perf_counter()
-        plddt = self.aux_heads(sm_out["s"])
-        mx.eval(plddt)
-        print(f"  [timing] AuxHeads (pLDDT):   {time.perf_counter()-t0:.3f}s")
+            # ── Structure module ──────────────────────────────────────────────
+            t0 = time.perf_counter()
+            if single.dtype == mx.float16:
+                single = single.astype(mx.float32)
+                s_z    = s_z.astype(mx.float32)
+            sm_out = self.structure_module(single, s_z, seq_mask)
+            mx.eval(sm_out["s"], sm_out["angles"], sm_out["n_ca_c"])
+            print(f"  [timing] StructureModule:    {time.perf_counter()-t0:.3f}s")
+
+            # ── pLDDT ─────────────────────────────────────────────────────────
+            t0 = time.perf_counter()
+            plddt = self.aux_heads(sm_out["s"])
+            mx.eval(plddt)
+            print(f"  [timing] AuxHeads (pLDDT):   {time.perf_counter()-t0:.3f}s")
+
+        else:
+            # ── Early-stop path: external loop with per-pass pLDDT check ─────
+            print(f"  [timing] FoldingTrunk (up to {num_recycling+1} passes, early-stop={early_stop}):")
+            s_z_proj, _pm = self.fold._project(s_s, s_z, seq_mask)
+            mx.eval(s_z_proj)
+            dists = mx.zeros((*s_z_proj.shape[:3], self.fold.disto_bins), dtype=s_z_proj.dtype)
+
+            for i in range(num_recycling + 1):
+                t_r = time.perf_counter()
+                preds, s_z, dists = self.fold._single_pass(s_z_proj, _pm, dists)
+                if s_z.dtype == mx.float16:
+                    preds = mx.clip(preds, -65000, 65000)
+                    s_z   = mx.clip(s_z,   -65000, 65000)
+                mx.eval(preds, s_z, dists)
+
+                # PairToSequence + StructureModule + pLDDT (~0.2s)
+                single = self.sz_project(s_z, s_s_stable, pair_mask)
+                if single.dtype == mx.float16:
+                    single = single.astype(mx.float32)
+                    s_z    = s_z.astype(mx.float32)
+                sm_out = self.structure_module(single, s_z, seq_mask)
+                plddt  = self.aux_heads(sm_out["s"])
+                mx.eval(plddt)
+
+                mean_plddt = float(mx.mean(plddt))
+                elapsed_r  = time.perf_counter() - t_r
+                stopped    = (mean_plddt >= early_stop and i < num_recycling)
+                tag        = " ← STOP" if stopped else ""
+                print(f"    [timing]   pass {i+1}/{num_recycling+1}: "
+                      f"mean pLDDT={mean_plddt:.1f}  {elapsed_r:.3f}s{tag}")
+                if stopped:
+                    break
+
+            print(f"  [timing] FoldingTrunk total: {time.perf_counter()-t0:.3f}s")
 
         result = {
             "preds": np.array(preds.astype(mx.float32)),

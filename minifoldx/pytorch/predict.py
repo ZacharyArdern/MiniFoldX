@@ -355,6 +355,8 @@ def prepare_input(seq, config, alphabet):
               help="Backbone model. esmc_600m requires --checkpoint.")
 @click.option("--max_encode_tokens", type=int, default=600,
               help="Token budget for batched ESMC encoding (esmc_600m only). Default 600.")
+@click.option("--early_stop", type=float, default=None,
+              help="Stop recycling when mean pLDDT >= this value (e.g. 85). Default: disabled.")
 def predict(
     fasta: str,
     out_dir: str = "./minifold_predictions",
@@ -369,6 +371,7 @@ def predict(
     force_cpu: bool = False,
     esm_model: str = "esmc_600m",
     max_encode_tokens: int = 600,
+    early_stop: Optional[float] = None,
 ) -> None:
     """Run predictions with Minifold."""
     torch.set_grad_enabled(False)
@@ -396,14 +399,14 @@ def predict(
 
     if esm_model == "esmc_600m":
         _predict_esmc(fasta, out_dir, checkpoint, device, config,
-                      num_recycling, max_encode_tokens)
+                      num_recycling, max_encode_tokens, early_stop)
     else:
         _predict_esm2_3b(fasta, out_dir, cache, checkpoint, device, config,
                          token_per_batch, compile, model_size, kernels,
-                         num_recycling, int8_esm2)
+                         num_recycling, int8_esm2, early_stop)
 
 
-def _predict_esmc(fasta, out_dir, checkpoint, device, config, num_recycling, max_encode_tokens):
+def _predict_esmc(fasta, out_dir, checkpoint, device, config, num_recycling, max_encode_tokens, early_stop=None):
     if checkpoint is None:
         raise click.UsageError("--checkpoint is required for esmc_600m.")
 
@@ -450,9 +453,27 @@ def _predict_esmc(fasta, out_dir, checkpoint, device, config, num_recycling, max
 
                 s_s = components["fc_s"](h)
                 s_z = components["fc_z"](attn_flat)
-                _, s_z_out = components["trunk"](s_s, s_z, mask, num_recycling=num_recycling)
-                single = components["sz_proj"](s_z_out, s_s, mask[:, None, :] * mask[:, :, None])
-                sm_out = components["sm"](s=single, z=s_z_out, aatype=aatype, mask=seq_mask)
+                pair_mask = mask[:, None, :] * mask[:, :, None]
+                if early_stop is not None:
+                    from minifold.train.loss import compute_plddt as _cplddt
+                    s_z_proj, pm_f, _ = components["trunk"]._project(s_s, s_z, mask[:, 0, :] if mask.dim() == 3 else mask)
+                    shape = tuple(s_z_proj.shape[:3]) + (components["trunk"].disto_bins,)
+                    dists = torch.zeros(shape, device=s_z_proj.device, dtype=s_z_proj.dtype)
+                    s_z_out = None
+                    for _i in range(num_recycling + 1):
+                        _, s_z_out, dists = components["trunk"]._single_pass(s_z_proj, pm_f, dists)
+                        _single = components["sz_proj"](s_z_out, s_s, pm_f)
+                        _sm = components["sm"](s=_single, z=s_z_out, aatype=aatype, mask=seq_mask)
+                        _mplddt = float(_cplddt(components["plddt_head"](_sm["single"])).mean())
+                        print(f"  pass {_i+1}/{num_recycling+1}: pLDDT={_mplddt:.1f}", flush=True)
+                        single, sm_out = _single, _sm
+                        if _mplddt >= early_stop and _i < num_recycling:
+                            print(f"  → early stop (>= {early_stop})", flush=True)
+                            break
+                else:
+                    _, s_z_out = components["trunk"](s_s, s_z, mask, num_recycling=num_recycling)
+                    single = components["sz_proj"](s_z_out, s_s, pair_mask)
+                    sm_out = components["sm"](s=single, z=s_z_out, aatype=aatype, mask=seq_mask)
 
                 of_feats = {
                     "aatype":                    aatype.unsqueeze(0),
@@ -490,7 +511,7 @@ def _predict_esmc(fasta, out_dir, checkpoint, device, config, num_recycling, max
 
 def _predict_esm2_3b(fasta, out_dir, cache, checkpoint, device, config,
                      token_per_batch, compile, model_size, kernels,
-                     num_recycling, int8_esm2):
+                     num_recycling, int8_esm2, early_stop=None):
     if checkpoint is None:
         download(cache, model_size)
         checkpoint = cache / f"minifold_{model_size}.ckpt"
@@ -547,7 +568,8 @@ def _predict_esm2_3b(fasta, out_dir, cache, checkpoint, device, config,
                 autocast_device = "cuda" if device.type == "cuda" else "mps"
                 autocast_ctx = torch.autocast(autocast_device, dtype=torch.bfloat16)
             with autocast_ctx:
-                out = model(model_batch, num_recycling=num_recycling)
+                out = model(model_batch, num_recycling=num_recycling,
+                            early_stop=early_stop)
                 out_pos  = out.pop("final_atom_positions")
                 out_mask = out.pop("final_atom_mask")
                 plddt    = out.pop("plddt")

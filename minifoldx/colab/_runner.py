@@ -72,6 +72,7 @@ def make_job_script(
     out_dest: str = "both",
     fasta_name: str = "input.fasta",
     has_drive: bool = True,
+    early_stop: float = None,
 ) -> str:
     """Return a Python script that runs on the Colab VM."""
     import subprocess as _sp
@@ -84,6 +85,8 @@ def make_job_script(
         extra_flags += ', "--kernels"'
     if int8_esm2:
         extra_flags += ', "--int8-esm2"'
+    if early_stop is not None:
+        extra_flags += f', "--early_stop", "{early_stop}"'
 
     predict_invocation = (
         f'run(sys.executable, {predict_script},\n'
@@ -695,6 +698,7 @@ def run_prediction(
     int8_esm2: bool,
     triton_kernels: bool = False,
     out_dest: str = "both",
+    early_stop: float = None,
 ) -> Path:
     """Upload FASTA, execute job script, download results. Returns local output dir."""
 
@@ -741,6 +745,7 @@ def run_prediction(
     job_script = make_job_script(
         job_id, model_size, token_per_batch, num_recycling,
         int8_esm2, triton_kernels, out_dest, fasta_name, drive,
+        early_stop=early_stop,
     )
     with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
         f.write(job_script)

@@ -53,6 +53,9 @@ def main():
 @click.option("--out", "out_dest", default="both",
               type=click.Choice(["both", "pwd", "drive"]), show_default=True,
               help="Where to save results: both (Drive + local pwd), pwd (local only), drive (Drive only).")
+@click.option("--early-stop", "early_stop", type=float, default=None,
+              metavar="PLDDT",
+              help="Stop recycling early when mean pLDDT >= this value (e.g. 85). Default: disabled.")
 def run(
     fasta: str,
     gpu: str,
@@ -64,6 +67,7 @@ def run(
     int8_esm2: bool,
     triton_kernels: bool,
     out_dest: str,
+    early_stop: float,
 ) -> None:
     """Run a MiniFold prediction on a fresh Colab GPU session."""
     check_deps()
@@ -80,7 +84,8 @@ def run(
 
     click.echo(f"Job ID  : {job_id}")
     click.echo(f"FASTA   : {fasta_path.name}  ({n_seqs} sequences)")
-    click.echo(f"GPU     : {gpu}  |  model: {model_size}  |  recycling: {num_recycling}")
+    click.echo(f"GPU     : {gpu}  |  model: {model_size}  |  recycling: {num_recycling}"
+               + (f"  |  early-stop: pLDDT>={early_stop}" if early_stop else ""))
     click.echo(f"ESM2    : {'int8 / bitsandbytes' if int8_esm2 else 'full precision'}")
     click.echo(f"Kernels : {'Triton (fused MLP/gating)' if triton_kernels else 'standard PyTorch'}")
     click.echo(f"Output  : {out_dest}")
@@ -105,7 +110,7 @@ def run(
         out_dir = run_prediction(
             fasta_path, job_id, session, model_size,
             token_per_batch, num_recycling, timeout, int8_esm2, triton_kernels,
-            out_dest,
+            out_dest, early_stop=early_stop,
         )
 
         pdbs = list(out_dir.rglob("*.pdb"))
@@ -126,6 +131,7 @@ def run(
             "gpu":           gpu,
             "model_size":    model_size,
             "num_recycling": num_recycling,
+            "early_stop":    early_stop,
             "created_at":    datetime.now(timezone.utc).isoformat(),
             "results":       str(out_dir),
         })
@@ -285,6 +291,106 @@ def train_fape(gpu: str, npz_path: str | None, timeout: int, out_dest: str,
             "job_id":     job_id,
             "type":       "train-fape",
             "gpu":        gpu,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "results":    str(out_dir),
+        })
+
+    finally:
+        import subprocess as _sp
+        _sp.run(["colab", "stop", "-s", session])
+
+
+@main.command(name="train-trunk")
+@click.option("--backbone",      default="esm2_650m",
+              type=click.Choice(["esm2_650m", "esmc_600m"]), show_default=True)
+@click.option("--gpu",           default="G4",   type=click.Choice(GPU_CHOICES), show_default=True)
+@click.option("--steps-phase1",  default=95000,  show_default=True,
+              help="Steps at lr-phase1.")
+@click.option("--steps-phase2",  default=5000,   show_default=True,
+              help="Steps at lr-phase2.")
+@click.option("--lr-phase1",     default=1e-4,   show_default=True)
+@click.option("--lr-phase2",     default=1e-5,   show_default=True)
+@click.option("--max-len",       default=180,    show_default=True)
+@click.option("--resume-ckpt",   default=None,
+              help="Local path to trunk_latest.pt to resume from. Uploaded directly to VM.")
+@click.option("--timeout",       default=28800,  show_default=True)
+@click.option("--out", "out_dest", default="both",
+              type=click.Choice(["both", "pwd", "drive"]), show_default=True)
+def train_trunk(backbone: str, gpu: str, steps_phase1: int, steps_phase2: int,
+                lr_phase1: float, lr_phase2: float, max_len: int,
+                resume_ckpt: str | None, timeout: int, out_dest: str) -> None:
+    """Train fc_s + fc_z + FoldingTrunk + sz_proj with frozen backbone on CATH S20."""
+    check_deps()
+
+    job_id  = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    session = f"minifold_trunk_{job_id}"
+
+    click.echo(f"Job ID   : {job_id}")
+    click.echo(f"GPU      : {gpu}  backbone: {backbone}")
+    click.echo(f"Phase 1  : {steps_phase1} steps @ lr={lr_phase1}")
+    click.echo(f"Phase 2  : {steps_phase2} steps @ lr={lr_phase2}")
+    if resume_ckpt:
+        click.echo(f"Resume   : {resume_ckpt}")
+    click.echo("")
+
+    colab("new", "--gpu", gpu, "-s", session)
+
+    drive = _has_drive()
+    from ._runner import make_trunk_training_script, RCLONE_CONF, HF_TOKEN_PATH, JOBS_REMOTE, _download_from_vm
+
+    try:
+        if drive:
+            colab("exec", "-s", session, "--timeout", "10", "-f", "/dev/stdin",
+                  input="import os; os.makedirs('/root/.config/rclone', exist_ok=True)", text=True)
+            colab("upload", "-s", session, str(RCLONE_CONF), "/root/.config/rclone/rclone.conf")
+
+        if HF_TOKEN_PATH.exists():
+            colab("exec", "-s", session, "--timeout", "10", "-f", "/dev/stdin",
+                  input="import os; os.makedirs('/root/.cache/huggingface', exist_ok=True)", text=True)
+            colab("upload", "-s", session, str(HF_TOKEN_PATH), "/root/.cache/huggingface/token")
+
+        # Upload resume checkpoint if provided
+        if resume_ckpt:
+            click.echo(f"Uploading checkpoint {resume_ckpt} ...")
+            colab("exec", "-s", session, "--timeout", "10", "-f", "/dev/stdin",
+                  input="import os; os.makedirs('/content/outputs', exist_ok=True)", text=True)
+            colab("upload", "-s", session, resume_ckpt, "/content/outputs/trunk_resume.pt")
+            click.echo("  Checkpoint uploaded.")
+
+        script = make_trunk_training_script(
+            job_id=job_id, backbone=backbone,
+            steps_phase1=steps_phase1, steps_phase2=steps_phase2,
+            lr_phase1=lr_phase1, lr_phase2=lr_phase2,
+            max_len=max_len, out_dest=out_dest, has_drive=drive,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+            f.write(script)
+            script_path = f.name
+
+        colab("exec", "-s", session, "-f", script_path, "--timeout", str(timeout))
+        click.echo("\nTraining complete.")
+
+        out_dir = Path("./minifold_trunk_results") / job_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if out_dest in ("both", "pwd"):
+            click.echo(f"Downloading checkpoints → {out_dir}/")
+            if drive and out_dest == "both":
+                import subprocess as _sp
+                r = _sp.run(["rclone", "copy", f"{JOBS_REMOTE}/{job_id}/outputs",
+                             str(out_dir), "--progress"])
+                if r.returncode not in (0, 3):
+                    click.echo(f"Warning: rclone download exited {r.returncode}", err=True)
+            else:
+                _download_from_vm(session, "/content/outputs", out_dir)
+            pts = list(out_dir.glob("*.pt"))
+            click.echo(f"{len(pts)} checkpoint(s) downloaded.")
+
+        save_job({
+            "job_id":     job_id,
+            "type":       "train-trunk",
+            "gpu":        gpu,
+            "backbone":   backbone,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "results":    str(out_dir),
         })

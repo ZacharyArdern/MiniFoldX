@@ -190,6 +190,28 @@ class FoldingTrunk(nn.Module):
 
         return preds, s_z_c
 
+    def _project(self, s_s, s_z, mask):
+        """One-time projection before the recycling loop (for early-stop path)."""
+        pair_mask = mask[:, None, :] * mask[:, :, None]
+        residx = torch.arange(s_s.shape[1], device=s_s.device)
+        residx = residx.unsqueeze(0).expand(s_s.shape[0], -1)
+        s_z_proj = torch.cat([
+            s_z,
+            self.seq_to_pair(s_s),
+            self.positional_embedding(residx, mask=pair_mask),
+        ], dim=-1)
+        s_z_proj = self.projection(s_z_proj)
+        return s_z_proj, pair_mask.to(s_z_proj), mask.to(s_z_proj)
+
+    def _single_pass(self, s_z_proj, pair_mask, dists):
+        """One recycling pass (for early-stop path)."""
+        s_z_c = s_z_proj + self.recycle(dists)
+        s_z_c = self.miniformer(s_z_c, pair_mask)
+        preds = self.fc_out(s_z_c + s_z_c.transpose(1, 2))
+        dists = preds.detach().argmax(dim=-1)
+        dists = nn.functional.one_hot(dists, self.disto_bins).to(s_z_proj)
+        return preds, s_z_c, dists
+
 
 class MiniFoldModel(nn.Module):
     def __init__(
@@ -268,7 +290,7 @@ class MiniFoldModel(nn.Module):
                 config_of.model["heads"],
             )
 
-    def forward(self, batch: dict, num_recycling: int = 0):
+    def forward(self, batch: dict, num_recycling: int = 0, early_stop: float = None):
         # Check if kernels are on
         if self.training and self.kernels:
             raise ValueError("Kernels can only be used at inference.")
@@ -289,7 +311,38 @@ class MiniFoldModel(nn.Module):
         s_z = s_z.view(B, N, N, -1)
         s_z = self.fc_z(s_z)
 
-        # Run folding blocks
+        if early_stop is not None and self.use_structure_module:
+            # Early-stop path: run structure module + pLDDT after each pass
+            from minifold.train.loss import compute_plddt
+            feats = tensor_tree_map(lambda t: t[..., 0], batch["batch_of"])
+            s_z_proj, pair_mask_f, _ = self.fold._project(s_s, s_z, batch["mask"])
+            shape = tuple(s_z_proj.shape[:3]) + (self.fold.disto_bins,)
+            dists = torch.zeros(shape, device=s_z_proj.device, dtype=s_z_proj.dtype)
+
+            preds, s_z_c, single, sm_out = None, None, None, None
+            for i in range(num_recycling + 1):
+                with torch.set_grad_enabled(self.training and (i == num_recycling)):
+                    preds, s_z_c, dists = self.fold._single_pass(s_z_proj, pair_mask_f, dists)
+                single = self.sz_project(s_z_c, s_s, pair_mask_f)
+                sm_out = self.structure_module(
+                    s=single, z=s_z_c,
+                    aatype=feats["aatype"],
+                    mask=feats["seq_mask"].to(dtype=single.dtype),
+                )
+                mean_plddt = float(compute_plddt(self.aux_heads.plddt(sm_out["single"])).mean())
+                print(f"  pass {i+1}/{num_recycling+1}: pLDDT={mean_plddt:.1f}", flush=True)
+                if mean_plddt >= early_stop and i < num_recycling:
+                    print(f"  → early stop (>= {early_stop})", flush=True)
+                    break
+
+            r_dict = {"preds": preds, "pair": s_z_c, "single": single, "sm": sm_out}
+            r_dict["final_atom_positions"] = atom14_to_atom37(sm_out["positions"][-1], feats)
+            r_dict["final_atom_mask"] = feats["atom37_atom_exists"]
+            r_dict["final_affine_tensor"] = sm_out["frames"][-1]
+            r_dict.update(self.aux_heads(r_dict))
+            return r_dict
+
+        # Standard path
         preds, s_z = self.fold(
             s_s,
             s_z,
